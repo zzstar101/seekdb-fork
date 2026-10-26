@@ -159,6 +159,17 @@ public:
         const share::schema::ObIndexType index_type,
         const int64_t original_parallelism,
         int64_t &decided_parallelism);
+  // Derive the parallelism used to build one fts aux table. Building the fts index table
+  // and the fts doc word table of one fulltext index is the dominant cost of the ddl:
+  // each of them scans the whole data table, analyzes every document and writes one row
+  // per document word. Those builds inherit the ddl parallelism, which is the serial
+  // default of one unless the user asked for a parallel ddl, so derive a build degree
+  // from the machine size in that case. All the aux tables of one fulltext index get the
+  // same degree so that they are built with the same slice layout.
+  static int calc_fts_build_parallelism(
+        const share::schema::ObIndexType index_type,
+        const int64_t original_parallelism,
+        int64_t &decided_parallelism);
 private:
   static int build_fts_aux_index_name(
     const ObIndexType type,

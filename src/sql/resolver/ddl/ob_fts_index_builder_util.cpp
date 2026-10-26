@@ -22,6 +22,7 @@
 #include "data_plane/fts/dict/ob_gen_dic_loader.h"
 #include "data_plane/fts/dict/ob_dic_lock_service.h"
 #include "share/ob_server_struct.h"
+#include "lib/cpu/ob_cpu_topology.h"
 #include "data_plane/fts/ob_fts_parser_helper.h"
 #include "share/schema/ob_multi_version_schema_service.h"
 #include "share/schema/ob_schema_utils.h"
@@ -1060,6 +1061,40 @@ int ObFtsIndexBuilderUtil::decide_parallelism(
         decided_parallelism = 1;
         break;
     }
+  }
+  return ret;
+}
+
+int ObFtsIndexBuilderUtil::calc_fts_build_parallelism(
+    const share::schema::ObIndexType index_type,
+    const int64_t original_parallelism,
+    int64_t &decided_parallelism)
+{
+  int ret = OB_SUCCESS;
+  // The fts index table and the fts doc word table of one index are built at the same
+  // time and both of them are cpu bound (scan + tokenize + per word row insert), while
+  // the historical default of a local index build without any ddl hint is a completely
+  // serial one. Cap the degree of both builds to the machine size so that the two
+  // concurrent builds can use all the cores. The value is only an upper bound of the
+  // degree: the number of build slices is still derived from the physical size of the
+  // data tablet, so a small table is not split into many tiny slices.
+  const int64_t MAX_FTS_BUILD_PARALLELISM = 8;
+  int64_t build_parallelism = 1;
+  if (OB_UNLIKELY(original_parallelism <= 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid original parallelism", K(ret), K(original_parallelism));
+  } else if (original_parallelism > 1) {
+    // an explicit degree (parallel ddl hint, table dop or force_parallel_ddl_dop) is
+    // already large enough, keep the historical per index type scaling
+    ret = decide_parallelism(index_type, original_parallelism, decided_parallelism);
+  } else {
+    const int64_t cpu_count = common::get_cpu_count();
+    build_parallelism = MIN(MAX(cpu_count, 1L), MAX_FTS_BUILD_PARALLELISM);
+    decided_parallelism = build_parallelism;
+  }
+  if (OB_SUCC(ret)) {
+    LOG_INFO("decide fts build parallelism", K(ret), K(index_type),
+        K(original_parallelism), K(decided_parallelism));
   }
   return ret;
 }
