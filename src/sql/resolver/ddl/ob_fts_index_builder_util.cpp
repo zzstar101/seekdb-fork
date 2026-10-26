@@ -1071,14 +1071,17 @@ int ObFtsIndexBuilderUtil::calc_fts_build_parallelism(
     int64_t &decided_parallelism)
 {
   int ret = OB_SUCCESS;
-  // The fts index table and the fts doc word table of one index are built at the same
-  // time and both of them are cpu bound (scan + tokenize + per word row insert), while
-  // the historical default of a local index build without any ddl hint is a completely
-  // serial one. Cap the degree of both builds to the machine size so that the two
-  // concurrent builds can use all the cores. The value is only an upper bound of the
-  // degree: the number of build slices is still derived from the physical size of the
-  // data tablet, so a small table is not split into many tiny slices.
+  // The fts index table and the fts doc word table of one fti are the only cpu bound
+  // aux builds (rowkey doc / doc rowkey are pure row copies) and they are built at the
+  // same time, whereas the historical default of a local index build without any ddl
+  // hint is a completely serial one. Share the machine between exactly these two
+  // builds. A larger degree does not buy more scan workers: the number of scan tasks
+  // of a freshly written tablet is derived from the tablet size and stays tiny, so
+  // oversubscribing the cores only adds scheduling overhead (measured: degree 8 was
+  // slower than degree 5 and degree 2 on a loaded box). The degree is still only an
+  // upper bound, the number of build slices is derived from the tablet size as before.
   const int64_t MAX_FTS_BUILD_PARALLELISM = 8;
+  const int64_t CONCURRENT_HEAVY_FTS_BUILDS = 2;
   int64_t build_parallelism = 1;
   if (OB_UNLIKELY(original_parallelism <= 0)) {
     ret = OB_INVALID_ARGUMENT;
@@ -1089,7 +1092,7 @@ int ObFtsIndexBuilderUtil::calc_fts_build_parallelism(
     ret = decide_parallelism(index_type, original_parallelism, decided_parallelism);
   } else {
     const int64_t cpu_count = common::get_cpu_count();
-    build_parallelism = MIN(MAX(cpu_count, 1L), MAX_FTS_BUILD_PARALLELISM);
+    build_parallelism = MIN(MAX(cpu_count / CONCURRENT_HEAVY_FTS_BUILDS, 1L), MAX_FTS_BUILD_PARALLELISM);
     decided_parallelism = build_parallelism;
   }
   if (OB_SUCC(ret)) {
