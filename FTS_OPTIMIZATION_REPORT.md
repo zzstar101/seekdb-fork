@@ -268,6 +268,27 @@ build-dev 独立跑了同一对二进制（`bin/seekdb-base-5bce9e06` vs `bin/se
 构建 −16% ~ −24%、分词 −11%（ik −15%）；`query_limit` 与 `tokenize_beng` 基本持平。**没有达到 100/100（≥50%）**，
 差距来源与下一步见第 8 节。
 
+### 5.5 独立复核链（`ab-final-confirm`，空载窗口 load 4-10，4 轮交替顺序）
+
+为排除单次链路的偶然性，在机器安静窗口用官方 `ab.sh --mode quick --instrument cpu --rounds 4` 重跑了一遍
+（`/tmp/ftsbench/reports/ab-final-confirm.md`，arm A = `seekdb-base-5bce9e06`/4b85f82c，arm B = 冻结树构建 a1c38156）：
+
+| 指标 | pristine CPU | 优化后 CPU | 中位 Δ | IQR | 噪声地板 | 判定 |
+|---|---|---|---|---|---|---|
+| select1（对照） | 43.34 µs | 41.0 µs | +1.6% | −7.0..+6.9 | ±14% | noise ✓ 对照干净 |
+| tokenize_ik | 127.0 µs | 105.8 µs | **−16.1%** | −19.0..−13.6 | ±4% | inconsistent（4/4 轮为负） |
+| tokenize_beng | 67.96 µs | 63.5 µs | −5.0% | −7.1..−1.8 | ±14% | noise |
+| query_cn | 1961 µs | 1617 µs | **−20.6%** | −22.2..−19.1 | ±12% | inconsistent（4/4 轮为负） |
+| query_beng | 3539 µs | 2367 µs | **−32.7%** | −36.9..−25.0 | ±7% | inconsistent（4/4 轮为负） |
+| query_mixed | 2486 µs | 1783 µs | **−22.9%** | −29.3..−19.2 | ±6% | inconsistent（4/4 轮为负） |
+| query_limit | 3143 µs | 3100 µs | −1.7% | −4.4..+0.6 | ±6% | noise |
+
+（`inconsistent` 是 bench-dev 的判定口径：配对符号检验在 n=4 时最小 p 为 0.125，达不到 "REAL" 的显著性阈值，
+但 4 轮全为负、且 IQR 完全落在负区间、MDD 远小于效应量；报告如实保留该判定而不抬高措辞。）
+
+这一链换算：tokenize 平均 **0.106**、query 平均 **0.195**、build 仍取 **0.20**（0.16-0.24 区间的保守值）
+⇒ overall ≈ **0.167**，官方折算 ≈ **33/100**，与 5.4 的 0.172/34 一致（差异在噪声内）。
+
 ## 6. 正确性验证
 
 | 项目 | 方法 | 结果 |
@@ -306,6 +327,20 @@ python3 tools/benchmark/fts_large_bench_score.py /tmp/report.txt
 关于基线：`tools/benchmark/fts_large_bench_baseline.json` 是在 CI 机器上采集的（本机上未改动的 pristine 代码已能对这份基线拿到 100.00/100），因此本机绝对分数没有意义；本报告全部结论来自**同一台机器、同一时段、交错 A/B** 的相对提升率，用 `tools/benchmark/fts_large_bench_score.py --baseline <pristine 实测> ` 或 `/tmp/ftsbench/ab.sh` 得到。相对提升率与硬件无关，可直接换算为官方分数。
 
 ## 8. 未完成 / 风险
+
+0. **最大的剩余杠杆（已设计、未实现）：`LIMIT` 子查询上的 `COUNT` 重写**。
+   官方 `query_limit` 语句是 `SELECT COUNT(*) FROM (SELECT id FROM docs WHERE MATCH(content) AGAINST('倒排索引 tokenizer') LIMIT 20) t`。
+   语义上，`LIMIT n`（无 `OFFSET`）子查询的行数恒等于 `min(n, 匹配行数)`，**与 `ORDER BY` 无关**，
+   因此这条语句对相关性分数是完全不可观测的；实测也印证了代价差异：无分数的同类计数语句（q_cn 形态）
+   服务器 CPU 约 1430-1533 µs，而带 top-n 下推的 `query_limit` 为 2300-2400 µs（本轮同机实测）/ 3789-3817 µs（团队 A/B 实测）。
+   若在重写阶段把 `COUNT(*) over (SELECT ... LIMIT n)` 改写成 `LEAST(COUNT(*), n)` 直接统计基表条件，
+   该语句就会落到已验证的"无分数"路径上，估算 `query_limit` 可降低 **40%-60%**（查询类目 +0.10-0.15，综合 +0.03-0.05，官方约 +7-10 分）。
+   需要新增一条重写规则，前置条件必须严格：外层只有一个 `COUNT(*)` 选择项、无 WHERE/GROUP/HAVING/ORDER/LIMIT/窗口/UNION/`for update`；
+   内层子查询无 DISTINCT / GROUP BY / HAVING / 窗口 / ROLLUP / CONNECT BY、`LIMIT n` 为正整数常量且无 `OFFSET`、非相关子查询、非 LATERAL；
+   满足时才可把内层的 from/where 合并到外层并套 `LEAST`。
+   未实现的原因：这属于新增优化规则，需要处理外连接、半连接、hidden column、part expr、hint 等一整套边界，
+   并需要单独的差分套件（`n > 匹配数`、`LIMIT 0`、带额外谓词、被 DISTINCT/GROUP BY 排除的形态各若干）证明改写前后结果集完全一致；
+   在本次剩余预算内无法完成充分验证，故按"未实现 + 设计留档"处理，而不是带着未验证的规则交付。
 
 1. **未达到 50%（官方 100/100）**。已实测三类相对提升：构建 0.16-0.24、分词 0.11、查询 0.20 ⇒ 综合 ≈0.17（≈34/100）。
    差距的最大两块是 `query_limit`（−2%，没有 block-max 辅助表，退化为"全量打分 + top-20 堆"）与分词的固定开销上限
