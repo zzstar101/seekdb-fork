@@ -18,6 +18,7 @@
 
 #include "lib/alloc/alloc_struct.h"
 #include "lib/allocator/page_arena.h"
+#include "lib/atomic/ob_atomic.h"
 #include "lib/charset/ob_charset.h"
 #include "common/json_type/ob_json_base.h"
 #include "common/json_type/ob_json_tree.h"
@@ -39,6 +40,131 @@ namespace oceanbase
 {
 namespace sql
 {
+
+namespace
+{
+/**
+ * TOKENIZE() rebuilds its fulltext parser configuration on every call: the parser name
+ * is parsed and re-serialized ("ik" -> "ik.1"), the parser properties JSON is parsed,
+ * rebuilt for the parser type and serialized again, and the result is parsed a second
+ * time to build the parser property object. None of that depends on the document, only
+ * on the SQL visible inputs (parser name, parser properties, collation), so this small
+ * fixed size cache takes the work off the hot path after the first call.
+ *
+ * A published entry is immutable and lives for the process lifetime, which is what makes
+ * it safe for a caller to borrow pointers into it: readers scan the slots without any
+ * lock (a slot is published with a release store of state_ and inspected after an acquire
+ * load of it) and nothing is ever evicted or freed. The slot count is bounded; once it is
+ * exhausted the per call work is simply still done and the miss is counted once.
+ */
+struct ObTokenizeParserConfigSlot final
+{
+  static constexpr int64_t MAX_RAW_NAME_LEN = 128;
+  static constexpr int64_t MAX_RAW_PROPERTIES_LEN = 512;
+  static constexpr int64_t MAX_INNER_NAME_LEN = storage::OB_FT_PARSER_NAME_LENGTH;
+  static constexpr int64_t MAX_FORMATTED_PROPERTIES_LEN = 512;
+
+  int64_t state_;              // 0 while being filled, 1 once fully published
+  int64_t dic_ready_;          // 1 once the builtin dictionary is loaded in this process
+  int32_t raw_name_len_;
+  int32_t raw_properties_len_;
+  int32_t coll_type_;
+  int32_t inner_name_len_;
+  int32_t formatted_properties_len_;
+  char raw_name_[MAX_RAW_NAME_LEN];
+  char raw_properties_[MAX_RAW_PROPERTIES_LEN];
+  char inner_name_[MAX_INNER_NAME_LEN];
+  char formatted_properties_[MAX_FORMATTED_PROPERTIES_LEN];
+  storage::ObFTParser parser_;
+  storage::ObFTParserProperty property_;
+};
+
+constexpr int64_t MAX_TOKENIZE_PARSER_CONFIGS = 8;
+ObTokenizeParserConfigSlot g_tokenize_parser_configs[MAX_TOKENIZE_PARSER_CONFIGS];
+int64_t g_tokenize_parser_config_cnt = 0;
+int64_t g_tokenize_parser_config_overflow_cnt = 0;
+
+bool same_input(const char *cached, const int32_t cached_len, const ObString &input)
+{
+  return cached_len == input.length()
+         && (0 == cached_len || 0 == MEMCMP(cached, input.ptr(), cached_len));
+}
+
+ObTokenizeParserConfigSlot *find_parser_config(const ObString &raw_parser_name,
+                                               const ObString &raw_properties,
+                                               const ObCollationType coll_type)
+{
+  ObTokenizeParserConfigSlot *slot = nullptr;
+  const int64_t slot_cnt =
+      MIN(ATOMIC_LOAD(&g_tokenize_parser_config_cnt), MAX_TOKENIZE_PARSER_CONFIGS);
+  for (int64_t i = 0; nullptr == slot && i < slot_cnt; ++i) {
+    ObTokenizeParserConfigSlot &candidate = g_tokenize_parser_configs[i];
+    if (1 == ATOMIC_LOAD_ACQ(&candidate.state_)
+        && static_cast<int32_t>(coll_type) == candidate.coll_type_
+        && same_input(candidate.raw_name_, candidate.raw_name_len_, raw_parser_name)
+        && same_input(candidate.raw_properties_, candidate.raw_properties_len_, raw_properties)) {
+      slot = &candidate;
+    }
+  }
+  return slot;
+}
+
+/**
+ * Best effort: a configuration that cannot be cached (a key too long to keep a copy of,
+ * or no free slot left) only keeps paying the per call cost, it must never fail the
+ * statement.
+ */
+void publish_parser_config(const ObString &raw_parser_name,
+                           const ObString &raw_properties,
+                           const ObCollationType coll_type,
+                           const ObString &inner_name,
+                           const ObString &formatted_properties,
+                           const storage::ObFTParser &parser,
+                           const storage::ObFTParserProperty &property)
+{
+  int64_t slot_cnt = ATOMIC_LOAD(&g_tokenize_parser_config_cnt);
+  if (raw_parser_name.length() > ObTokenizeParserConfigSlot::MAX_RAW_NAME_LEN
+      || raw_properties.length() > ObTokenizeParserConfigSlot::MAX_RAW_PROPERTIES_LEN
+      || inner_name.length() > ObTokenizeParserConfigSlot::MAX_INNER_NAME_LEN
+      || formatted_properties.length()
+             > ObTokenizeParserConfigSlot::MAX_FORMATTED_PROPERTIES_LEN) {
+    // Too long to keep a copy of, keep doing the work per call.
+  } else if (slot_cnt >= MAX_TOKENIZE_PARSER_CONFIGS) {
+    if (1 == ATOMIC_AAF(&g_tokenize_parser_config_overflow_cnt, 1)) {
+      LOG_INFO("no free tokenize parser config slot, do not cache", K(slot_cnt));
+    }
+  } else if (!ATOMIC_BCAS(&g_tokenize_parser_config_cnt, slot_cnt, slot_cnt + 1)) {
+    // Another thread claimed this slot first, caching is skipped for now.
+  } else {
+    ObTokenizeParserConfigSlot &slot = g_tokenize_parser_configs[slot_cnt];
+    slot.raw_name_len_ = static_cast<int32_t>(raw_parser_name.length());
+    slot.raw_properties_len_ = static_cast<int32_t>(raw_properties.length());
+    slot.coll_type_ = static_cast<int32_t>(coll_type);
+    slot.inner_name_len_ = static_cast<int32_t>(inner_name.length());
+    slot.formatted_properties_len_ = static_cast<int32_t>(formatted_properties.length());
+    slot.dic_ready_ = 0;
+    if (slot.raw_name_len_ > 0) {
+      MEMCPY(slot.raw_name_, raw_parser_name.ptr(), slot.raw_name_len_);
+    }
+    if (slot.raw_properties_len_ > 0) {
+      MEMCPY(slot.raw_properties_, raw_properties.ptr(), slot.raw_properties_len_);
+    }
+    if (slot.inner_name_len_ > 0) {
+      MEMCPY(slot.inner_name_, inner_name.ptr(), slot.inner_name_len_);
+    }
+    if (slot.formatted_properties_len_ > 0) {
+      MEMCPY(slot.formatted_properties_,
+             formatted_properties.ptr(),
+             slot.formatted_properties_len_);
+    }
+    slot.parser_ = parser;
+    slot.property_ = property;
+    // The fields above must be visible before the slot is published to the readers.
+    ATOMIC_STORE_REL(&slot.state_, 1);
+  }
+}
+} // namespace
+
 ObExprTokenize::ObExprTokenize(common::ObIAllocator &alloc)
     : ObStringExprOperator(alloc,
                            T_FUN_TOKENIZE,
@@ -90,34 +216,43 @@ int ObExprTokenize::tokenize_fulltext(const TokenizeParam &param,
 
   if (TokenizeParam::OUTPUT_MODE::DEFAULT != mode && TokenizeParam::OUTPUT_MODE::ALL != mode) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_FAIL(tokenize_helper.init(&allocator, param.parser_name_, param.properties_))) {
-  } else if (OB_FAIL(token_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
-  } else if (
-      (0 != param.fulltext_.length())
-      && OB_FAIL(tokenize_helper.segment(
-                     param.meta_,
-                     param.fulltext_.ptr(),
-                     param.fulltext_.length(),
-                     doc_len,
-                     token_map))) {
   } else {
-    switch (param.output_mode_) {
-    case TokenizeParam::OUTPUT_MODE::DEFAULT: {
-      if (OB_FAIL(tokenize_helper.make_token_array_json(token_map, result))) {
-      } else {
-        // pass
-      }
-      break;
+    if (nullptr != param.cached_parser_ && nullptr != param.cached_property_) {
+      // The parser description of this configuration was built before, reuse it instead
+      // of parsing the parser name and the properties JSON again.
+      ret = tokenize_helper.init(&allocator, *param.cached_parser_, *param.cached_property_);
+    } else {
+      ret = tokenize_helper.init(&allocator, param.parser_name_, param.properties_);
     }
-    case TokenizeParam::OUTPUT_MODE::ALL: {
-      if (OB_FAIL(tokenize_helper.make_detail_json(token_map, doc_len, result))) {
-      } else {
-        // pass
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(token_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
+    } else if (
+        (0 != param.fulltext_.length())
+        && OB_FAIL(tokenize_helper.segment(
+                       param.meta_,
+                       param.fulltext_.ptr(),
+                       param.fulltext_.length(),
+                       doc_len,
+                       token_map))) {
+    } else {
+      switch (param.output_mode_) {
+      case TokenizeParam::OUTPUT_MODE::DEFAULT: {
+        if (OB_FAIL(tokenize_helper.make_token_array_json(token_map, result))) {
+        } else {
+          // pass
+        }
+        break;
       }
-      break;
-    }
-    default:
-      ret = OB_INVALID_ARGUMENT;
+      case TokenizeParam::OUTPUT_MODE::ALL: {
+        if (OB_FAIL(tokenize_helper.make_detail_json(token_map, doc_len, result))) {
+        } else {
+          // pass
+        }
+        break;
+      }
+      default:
+        ret = OB_INVALID_ARGUMENT;
+      }
     }
   }
   return ret;
@@ -128,6 +263,9 @@ ObExprTokenize::TokenizeParam ::TokenizeParam()
     parser_name_(ObString(OB_DEFAULT_FULLTEXT_PARSER_NAME)),
     meta_(),
     fulltext_(),
+    cached_parser_(nullptr),
+    cached_property_(nullptr),
+    dic_ready_(nullptr),
     output_mode_(OUTPUT_MODE::DEFAULT)
 {
 }
@@ -200,8 +338,8 @@ int ObExprTokenize::parse_param(const ObExpr &expr,
 {
   int ret = OB_SUCCESS;
 
-  ObDatum *parser_params_datum;
-  ObString raw_parser_name = ObString::make_string(OB_DEFAULT_FULLTEXT_PARSER_NAME);
+  ObString raw_parser_name;
+  ObString raw_properties;
 
   ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
   
@@ -210,10 +348,41 @@ int ObExprTokenize::parse_param(const ObExpr &expr,
   if (OB_UNLIKELY(expr.arg_cnt_ < 1 || expr.arg_cnt_ > 3)) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(parse_fulltext(expr, ctx, param))) {
-  } else if (OB_FAIL(parse_parser_name(expr, ctx, param))) {
+  } else if (OB_FAIL(eval_parser_name(expr, ctx, raw_parser_name))) {
   } else if (OB_FAIL(parse_parser_properties(expr, ctx, temp_allocator, param))) {
-  } else if (OB_FAIL(param.reform_parser_properties(param.properties_))) {
-  } else if (OB_FAIL(param.try_load_dictionary_for_ik())) {
+  } else {
+    raw_properties = param.properties_;
+    ObTokenizeParserConfigSlot *slot = find_parser_config(
+        raw_parser_name, raw_properties, param.meta_.get_collation_type());
+    if (nullptr != slot) {
+      // Built before for exactly these inputs: borrow the parser description and the
+      // reformed properties instead of building them again.
+      param.parser_name_ = ObString(slot->inner_name_len_, slot->inner_name_);
+      param.properties_ = ObString(slot->formatted_properties_len_, slot->formatted_properties_);
+      param.cached_parser_ = &slot->parser_;
+      param.cached_property_ = &slot->property_;
+      param.dic_ready_ = &slot->dic_ready_;
+    } else if (OB_FAIL(construct_ft_parser_inner_name(raw_parser_name, param))) {
+    } else if (OB_FAIL(param.reform_parser_properties(param.properties_))) {
+    } else {
+      storage::ObFTParser parser;
+      storage::ObFTParserProperty property;
+      // Preparing the cached description is best effort: a failure here only loses the
+      // caching opportunity and must not fail the statement.
+      if (OB_SUCCESS == parser.parse_from_str(param.parser_name_.ptr(), param.parser_name_.length())
+          && OB_SUCCESS == property.parse_for_parser_helper(parser, param.properties_)) {
+        publish_parser_config(raw_parser_name,
+                              raw_properties,
+                              param.meta_.get_collation_type(),
+                              param.parser_name_,
+                              param.properties_,
+                              parser,
+                              property);
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(param.try_load_dictionary_for_ik())) {
+    }
   }
   return ret;
 }
@@ -313,27 +482,20 @@ int ObExprTokenize::parse_fulltext(const ObExpr &expr, ObEvalCtx &ctx, TokenizeP
   return ret;
 }
 
-int ObExprTokenize::parse_parser_name(const ObExpr &expr, ObEvalCtx &ctx, TokenizeParam &param)
+int ObExprTokenize::eval_parser_name(const ObExpr &expr,
+                                     ObEvalCtx &ctx,
+                                     ObString &raw_parser_name)
 {
   int ret = OB_SUCCESS;
   ObDatum *parser_datum = nullptr;
-  ObString raw_parser_name;
 
   if (expr.arg_cnt_ < 2) {
     raw_parser_name = ObString::make_string(OB_DEFAULT_FULLTEXT_PARSER_NAME);
   } else if (OB_FAIL(expr.args_[1]->eval(ctx, parser_datum))) {
+  } else if (parser_datum->is_null()) {
+    raw_parser_name = ObString::make_string(OB_DEFAULT_FULLTEXT_PARSER_NAME);
   } else {
-    if (parser_datum->is_null()) {
-      raw_parser_name = ObString::make_string(OB_DEFAULT_FULLTEXT_PARSER_NAME);
-    } else {
-      ObString name = parser_datum->get_string();
-      raw_parser_name = name.trim();
-    }
-  }
-
-  if (OB_FAIL(ret)) {
-    // already logged
-  } else if (OB_FAIL(construct_ft_parser_inner_name(raw_parser_name, param))) {
+    raw_parser_name = parser_datum->get_string().trim();
   }
 
   return ret;
@@ -394,7 +556,10 @@ int ObExprTokenize::TokenizeParam::try_load_dictionary_for_ik()
   int ret = OB_SUCCESS;
   bool need_to_load_dic = false;
   storage::ObDicLoaderHandle dic_loader_handle;
-  if (OB_FAIL(share::ObFtsIndexBuilderUtil::check_need_to_load_dic(
+  if (nullptr != dic_ready_ && 1 == ATOMIC_LOAD(dic_ready_)) {
+    // The builtin dictionary of this parser is already loaded in this process: the loader
+    // keeps that state and never clears it, so resolving and loading it again is a no-op.
+  } else if (OB_FAIL(share::ObFtsIndexBuilderUtil::check_need_to_load_dic(
           parser_name_, need_to_load_dic))) {
   } else if (need_to_load_dic) {
     if (OB_FAIL(storage::ObGenDicLoader::get_instance().get_dic_loader(
@@ -404,6 +569,8 @@ int ObExprTokenize::TokenizeParam::try_load_dictionary_for_ik()
     } else if (OB_UNLIKELY(!dic_loader_handle.is_valid())) {
       ret = OB_ERR_UNEXPECTED;
     } else if (OB_FAIL(dic_loader_handle.get_loader()->try_load_dictionary_in_trans())) {
+    } else if (nullptr != dic_ready_) {
+      ATOMIC_STORE(dic_ready_, 1);
     }
   }
   return ret;

@@ -25,6 +25,12 @@
 
 namespace oceanbase
 {
+namespace storage
+{
+class ObFTParser;
+struct ObFTParserProperty;
+}
+
 namespace sql
 {
 class MultimodeAlloctor;
@@ -73,6 +79,15 @@ private:
     ObString properties_;
     ObObjMeta meta_;
     ObString fulltext_;
+    // Set when the parser configuration of this call comes from the shared
+    // configuration cache. The pointed to objects live in the cache slot, are
+    // immutable once published and outlive the call, so they are borrowed instead of
+    // being rebuilt (see ob_expr_tokenize.cpp).
+    const storage::ObFTParser *cached_parser_;
+    const storage::ObFTParserProperty *cached_property_;
+    // Dic loader state of the cache slot: once the builtin dictionary of the parser is
+    // loaded in this process, resolving the loader is a no-op.
+    int64_t *dic_ready_;
     enum OUTPUT_MODE
     {
       DEFAULT,
@@ -87,7 +102,7 @@ private:
                          TokenizeParam &param);
 
   static int parse_fulltext(const ObExpr &expr, ObEvalCtx &ctx, TokenizeParam &param);
-  static int parse_parser_name(const ObExpr &expr, ObEvalCtx &ctx, TokenizeParam &param);
+  static int eval_parser_name(const ObExpr &expr, ObEvalCtx &ctx, ObString &raw_parser_name);
   static int parse_parser_properties(const ObExpr &expr,
                                      ObEvalCtx &ctx,
                                      MultimodeAlloctor &mm_alloc,

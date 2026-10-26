@@ -162,6 +162,18 @@ public:
       const common::ObString &parser_name,
       const common::ObString &parser_properties);
   /**
+   * Initialize from an already parsed parser description.
+   *
+   * The two arguments are exactly what init() derives from the "name.version" string
+   * and the parser properties JSON, so a caller that keeps a parser configuration
+   * cached can skip parsing both of them on every call. The parser properties must be
+   * self contained: their strings must not point into a temporary buffer.
+   */
+  int init(
+      common::ObIAllocator *allocator,
+      const ObFTParser &parser,
+      const ObFTParserProperty &property);
+  /**
    * Split document into multiple words
    *
    * @param[in] type, collation type for fulltext
