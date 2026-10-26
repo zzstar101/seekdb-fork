@@ -320,6 +320,16 @@ python3 tools/benchmark/fts_large_bench_score.py /tmp/report.txt
    `evaluate_pivot` 46% / 每次 pivot 跳转重填 256 条 posting 25% / micro-block decode 14%），
    而短批次重填必须连带收缩 eval frame、`ObDatumVector::mask_`、`skip_`（此前的粗暴版本因数组越界 abort 已回滚）。
    该实验（含 19233 µs 这个反例）已回滚，未进入提交。
+   **第二个已实测并否定的方向（缩小 advance 后的重填批次）**：在
+   `ObTextRetrievalDaaTTokenIter::get_next_row()` 里把 `advance_to()` 之后的 `get_next_batch`
+   容量从 `max_batch_size_`（256）降到 16（新增 `get_refill_capacity()`，`after_advance_` 标记），
+   假设"pivot 跳转只消费 1 条 posting，重填 256 条是浪费"。实测相反：`query_limit` 服务器 CPU
+   从 **2300-2400 µs 涨到 3767 µs（+60%）**。
+   原因是每次重填都伴随一次 `das_scan_advance` 重新定位（重写 key range + 重新做 dascan seek），
+   而 BMW 主循环在一次定位后会连续消费很多条 posting，所以 256 条的批次是在摊薄 seek 成本，
+   并非浪费。据此结论更新为：`query_limit` 的开销是"pivot 定位 seek 次数"本身的性质，
+   要改善必须减少 seek —— 也就是需要真正的 block-max 统计（辅助表）让 WAND 能跳过整块，
+   而不是调整批次大小。该实验同样已回滚，未进入提交。
 3. **分词指标的固定开销**：官方 `tokenize_ik` 里 SQL 解析、表达式框架、JSON 序列化与结果集编码占大部分，分词器本身只占约一半；即使分词器再快一倍，指标也只有约 25-30% 的空间。本次分词器侧实测 ≈-10..-19%（tokenize_ik）。
 4. **构建并行度的不确定性**：dop 的最优值依赖机器负载（空载时 8 最好，有外部负载时 2-5 最好，8 会因 4 个辅助任务 × 8 worker 超订而退化）。最终取保守的 `cpu_count/2`，在两种情况下都不会灾难性退化，但也没有吃到空载时的全部收益。
 5. **构建的并行下限（已实现、实测、并主动回滚）**：PX 任务数由 `ObParallelRangeTaskPlanner::compute_total_task_count()`
