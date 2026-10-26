@@ -313,7 +313,20 @@ python3 tools/benchmark/fts_large_bench_score.py /tmp/report.txt
 2. **query_limit 无解的部分**：`LIMIT 20` 的语义是"按相关性排序后的前 20 条"，因此不能提前终止；该路径必须计算分数。要显著改善它需要 block-max/WAND 所需的辅助表在 DDL 阶段真正建出来（`need_block_max_scan()` 存在，但本次基准的隐藏辅助表中没有 block-max 表），属于跨 DDL/存储/执行的改动，未在本次完成。
 3. **分词指标的固定开销**：官方 `tokenize_ik` 里 SQL 解析、表达式框架、JSON 序列化与结果集编码占大部分，分词器本身只占约一半；即使分词器再快一倍，指标也只有约 25-30% 的空间。本次分词器侧实测 ≈-10..-19%（tokenize_ik）。
 4. **构建并行度的不确定性**：dop 的最优值依赖机器负载（空载时 8 最好，有外部负载时 2-5 最好，8 会因 4 个辅助任务 × 8 worker 超订而退化）。最终取保守的 `cpu_count/2`，在两种情况下都不会灾难性退化，但也没有吃到空载时的全部收益。
-5. **构建的并行下限**：PX 任务数受 `px_task_size` 与 tablet 大小限制，新建 tablet 主要在内存表中，基本只有 1-2 个 granule，因此 dop 只增加写 slice 而不增加扫描 worker；进一步需要改 granule 生成策略。
+5. **构建的并行下限（已量化，判定为不值得改）**：PX 任务数由 `ObParallelRangeTaskPlanner::compute_total_task_count()`
+   （参数见 `src/data_plane/api/data_plane/access/ob_parallel_range_task_planner.h`，`min_task_access_size_kb_ = px_task_size>>10`）
+   与 `ObGranuleUtil::compute_task_count_each_partition()`（`src/sql/engine/px/ob_granule_util.cpp:284`，
+   `total_size <= 0` 时每个分区强制只切 1 个任务）共同决定；新建 tablet 的数据主要在内存表、
+   `get_multi_ranges_cost()` 接近 0，因此基本只有 1-2 个 granule，dop 只增加写 slice 而不增加扫描 worker。
+   实测（`px_task_size` 2M → 128K，即 granule 数放大 16 倍；同一 binary、同一实例、各跑两次）：
+   2M 三次 ALTER 墙钟 5.977/4.523/2.468 s 与 5.516/4.426/2.828 s（合计 12.97/12.77）；
+   128K 为 5.766/4.156/2.466 s 与 4.924/4.066/2.886 s（合计 12.39/11.88）。
+   ⇒ 即使 granule 数放大 16 倍，构建墙钟只改善约 5-9%，说明该 `INSERT..SELECT` 的关键路径不是"扫描/分词并行度"，
+   而是每个写 slice 内部的排序与写入（与 dop 扫描最优点落在 2-3 的结论一致）。
+   结论：把 granule 下限硬编到 `dop` 属于通用 PX 行为改动、收益上限 <10%，**不做**；
+   真正的下一步是减少每个写 slice 内部的工作量——每篇文档在一次 ALTER 中被分词两次
+   （`__idx_<t>_<name>` 与 `..._fts_doc_word` 各走一遍 `ObDASDomainUtils::generate_fulltext_word_rows`），
+   这属于 DDL 计划结构级改动，调用链已在第 3 节记录。
 6. **词典视图的失效钩子**：`ObFTDictHub::invalidate_views()` 已存在但当前没有调用点（内建词典进程生命周期内不可变）。如果将来支持在线词典更新，必须在词典重载处调用它，否则视图会读到旧词典。
 7. **回表限制**：`is_index_back=true` 的全文扫描必须保留相关性（回表路径只按"带相关性的 children 数组"实现）。这是本次调试中发现的既有约束，已用"回表则不加优化"的方式保守处理。
 8. **量化证据的边界**：单次运行的噪声极大（同一 binary 的 query_cn 在 1.55-3.10 ms 之间浮动，构建 1.6-8.1 s），所有结论都基于交错 A/B 的中位数与配对检验；构建类指标在负载 >25 时不可分辨，本报告对构建类的结论标注为"该负载下无法分辨"。
