@@ -412,6 +412,30 @@ tokenize_ik=0.1509 tokenize_beng=0.1000 query_cn=1.9403 query_beng=2.6555 query_
 所以没有一致变化——两条观测互相印证。`src/sql/das/ob_das_domain_utils.cpp:71` 的 `ObFTIndexRowCache::init`
 每个索引只做一次配置初始化，故 parser 配置缓存对构建无贡献（结构上已排除）。
 
+
+### 5.9 wall 口径的累积确认链（官方计时方式，独立复核）
+
+`ab.sh --mode full` 交替臂序，A=`bin/seekdb-base-5bce9e06`（sha `4b85f82c`，pristine `5bce9e06`），
+B=`bin/seekdb-final2`（sha/build id `383b8f7c`，git HEAD `cce137f84`；其后 `f049246c6` 仅为文档提交）。
+两次独立链（n=3 与 n=4）在无漂移轮次（两臂 load 2/2）上的逐轮值：
+
+| 指标 | A | B | 无漂移轮 Δ | 方向 |
+|---|---|---|---|---|
+| build_ik_all | 5.87 s | 4.168 s | **−25.0% / −15.7%** | 一致为负 |
+| build_ik_content | 4.521 s | 3.195 s | **−7.0% / −16.5%** | 一致为负 |
+| build_beng_en | 2.377 s | 1.756 s | **−27.6% / −12.2%** | 一致为负 |
+| tokenize_ik | 0.192 ms | 0.1183 ms | **−12.4% / −21.7%** | 一致为负 |
+| tokenize_beng | 0.1511 ms | 0.07945 ms | **−4.3% / −9.8%** | 一致为负 |
+| query_cn | 2.768 ms | 1.318 ms | **−22.5% / −28.3%** | 一致为负 |
+| query_beng | 2.819 ms | 2.094 ms | **−16.0% / −24.0%** | 一致为负 |
+| query_mixed | 2.000 ms | 1.457 ms | **−17.5% / −28.8%** | 一致为负 |
+| query_limit | 2.756 ms | 0.2524 ms | **−88.4% / −90.1%** | 一致为负 |
+
+两链的高负载轮（B 臂 load 17-23）给出更大但不可作效果量引用的幅度（如 query_limit −95.4%、build −67%）；
+select1 对照两链分别为 +21.7% / +6.3% 且逐轮变号 ⇒ 无语句循环层面的回归。
+**结论：wall 口径与 CPU 计数口径、quiet-window n=5 构建链三者方向完全一致，量级互相覆盖，
+故 §5.8 定案的 overall ≈0.258（≈52/100，区间 49-56）不需要调整。**
+
 ## 6. 正确性验证
 
 | 项目 | 方法 | 结果 |
