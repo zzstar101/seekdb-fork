@@ -562,6 +562,7 @@ python3 tools/benchmark/fts_large_bench_score.py /tmp/report.txt
 | 去掉 text-retrieval 的 top-n 下推（`try_push_topn_into_text_retrieval_scan` 提前返回） | 让 LIMIT 不被下推到扫描 | `query_limit` **2300 → 19233 µs（8.4× 更差）**：该查询 `is_index_back=true`，下推时只为 20 行付打分代价，不下推要为 9333 个候选付 | 回滚。top-n 下推必须保留 |
 | `query_limit` 短批量回填（advance 后只回填 16 行） | 每次 pivot 跳转只消费一个 posting，减少解码 | **+60% 更差**（3766 vs 2400 µs）：每次回填都要付一次 `das_scan_advance` 重定位，256 行批量摊薄了 seek | 回滚。q_limit 的成本是 pivot seek 次数本身，只能靠 block-max 统计消除 |
 | 跳过 `ObMacroBlockWriter::check_order()`（默认开启的 `need_check_order_` 闸门，仅 DDL 辅助表关闭） | 逐行校验 rowkey 序，中段占单 worker self-CPU 11.0% | 语义干净（semcheck 1594 OK、索引布局/df/postings/docword 一致），闸门生效可证（check_order 188 样本→0，write 桶 26.4%→5.9%），但上限 ≈构建 wall 4-5% ⇒ ≤1.5 分，每 ALTER wall 的配对 A/B 未越噪声 | 回滚（inside noise）。三项数字均为 mid-ALTER self-CPU 份额，不等于 build wall |
+| 串行化同一 ALTER 的两张重辅助表构建（实验用差量：`FTS_AUX_GAP_MS` 把 doc-word 辅助任务推迟提交，未进入分支） | 两张重表并发提交，抢同一批 PX/DDL worker，怀疑互相拖慢 | gap=0（并发）：ALTER#2 wall **3.742 s**，索引表 2.924 s + 词表 3.584 s 同一时刻起跑；ALTER#3 wall **2.346 s**（1.988 + 2.131 s）。gap=30 s（各自独跑）：索引表 **4.138 s**、词表 **4.672 s**（起跑正好晚 30.0 s），ALTER#3 为 1.653 + 3.231 s ⇒ 串行总量 8.81 s（#2）/ 4.88 s（#3） | 回滚。**并发已是最优**：独跑的单表墙钟并不比并发时更快，串行化会把 ALTER wall 抬高 ~2.1-2.4×；每张表的瓶颈是延迟（单线程尾部 + latch/IO 等待），交错执行正好填满等待期 |
 
 **方法论教训**（已写入 §2）：本轮两次假阳性都来自负载混淆——一次是「granule −19%」（load 18 vs load 6 的两段数据），一次是同二进制 5 次 full run 的 1.9-2.7× 抖动。规则因此改为：只认交替臂序的配对链 + 服务器 CPU 计数（CV 3-9%）作主指标，wall 仅作确认，且任何结论必须写出 IQR 与噪声底线。
 
@@ -680,6 +681,22 @@ PX COORDINATOR                                         (dop=5)
 - 死路 B：`OPTIMIZER STATS GATHER` 无法从 DDL SQL 关掉——它由
   `ObDelUpdLogPlan::allocate_optimizer_stats_gathering_as_top`（`src/sql/optimizer/ob_del_upd_log_plan.cpp:917-950`）在 PDML
   builder 传非空 `osg_info` 时装配，没有 session/config 开关（`grep need_optimizer_stats_gathering|enable_optimizer_stats` 为空）。
+
+### 10.3 串行化实验：并发提交本来就是最优（build-dev，2026-10-27 07:51）
+
+假设：两张重辅助表（`__idx_…_<name>` 与 `__idx_…_<name>_fts_doc_word`）并发提交、抢同一批 worker，串行化或许更快。
+做法：在 `ObFtsIndexBuildTask::prepare_aux_table()` 的 doc-word 提交点插入 `getenv("FTS_AUX_GAP_MS")` 门控的
+`ob_usleep`（仅实验用，已回滚），让索引表先独跑完、再启动词表，于是**每张表都能从 server log 拿到自己的独跑墙钟**
+（`execute sql` → `build index sstable finish`）。交替测量并发/独跑两相：
+
+| ALTER | 并发（gap=0）wall | 索引表 / 词表（并发） | 独跑（gap=30 s）索引表 / 词表 | 串行总量 |
+|---|---|---|---|---|
+| #2 `fti_content_ik` | **3.742 s**（load 13.65，CPU 8.23 s） | 2.924 s / 3.584 s | **4.138 s** / **4.672 s** | 8.81 s |
+| #3 `fti_en_beng` | **2.346 s**（load 12.71） | 1.988 s / 2.131 s | 1.653 s / 3.231 s | 4.88 s |
+
+结论：并发 wall 3.74 s vs 串行 8.81 s（#2）、2.35 s vs 4.88 s（#3）⇒ **串行化劣 2.1-2.4×**，且独跑的单表墙钟
+甚至不比并发时更低——单张表的瓶颈是**延迟**（尾部单线程写 + 等 latch/IO），不是抢占 CPU，两表交错正好互相填满等待期。
+因此「让两张表不要互相抢资源」不是可回收的损失，已完成（含 dop 提交）的并发行为已经是这一维度的最优点。
 
 **对 (a)/(b)/(c) 的 final 判定：** (a) 砍冗余扫描 = **死**（granule 互不重叠、CPU-s 与 dop 无关、`px_task_size` 已证伪）；
 (b) 更便宜的归并 / 按分片直写 = **唯一还有量级的地方，但由 PDML 计划形状（MATERIAL + dop=1 单流 + QC 归并）决定，
