@@ -12037,15 +12037,42 @@ int ObLogPlan::prepare_text_retrieval_scan(const ObIArray<ObRawExpr *> &scan_mat
                                                  table_scan->get_text_retrieval_info()))) {
   } else {
     ObTextRetrievalInfo &tr_info = table_scan->get_text_retrieval_info();
+    bool need_calc_relevance = true;
+    ObSEArray<ObExprConstraint, 2> constraints;
     tr_info.match_expr_ = match_against;
     tr_info.pushdown_match_filter_ = match_pred;
-    // The mapping table is absent when the data-table rowkey is used as the document ID.
-    table_scan->set_doc_id_index_table_id(tr_info.doc_id_idx_tid_);
-    if (table_scan->is_vec_adaptive_scan() || table_scan->is_vec_idx_scan_post_filter()) {
-      table_scan->set_rowkey_doc_table_id(tr_info.rowkey_idx_tid_);
+    if (table_scan->get_index_back()) {
+      // The scan needs to look up the main table by the document rowkey, and the auxiliary
+      // children used by the index back path are only generated together with the relevance,
+      // so keep the relevance for this kind of plans.
+    } else if (OB_FAIL(ObTransformUtils::check_need_calc_match_score(
+                  get_optimizer_context().get_exec_ctx(),
+                  get_stmt(),
+                  match_against,
+                  match_pred,
+                  need_calc_relevance,
+                  constraints))) {
+      LOG_WARN("failed to check whether need to calculate match score", K(ret));
+    } else if (!need_calc_relevance) {
+      // The relevance score is not required, the pushed down match filter only checks
+      // whether the document matches, and every document produced by the full text
+      // retrieval scan satisfies it, so the filter is removed from the plan.
+      tr_info.need_calc_relevance_ = false;
+      tr_info.pushdown_match_filter_ = NULL;
+      if (OB_FAIL(append_array_no_dup(get_optimizer_context().get_query_ctx()->all_expr_constraints_,
+                                      constraints))) {
+        LOG_WARN("failed to append expr constraints", K(ret));
+      }
     }
-    if (OB_FAIL(table_scan->set_is_skip_rowkey_doc(tr_info.doc_id_idx_tid_ == OB_INVALID_ID))) {
-    } else if (OB_FAIL(table_scan->set_is_skip_rowkey_doc(tr_info.rowkey_idx_tid_ == OB_INVALID_ID))) {
+    if (OB_SUCC(ret)) {
+      // The mapping table is absent when the data-table rowkey is used as the document ID.
+      table_scan->set_doc_id_index_table_id(tr_info.doc_id_idx_tid_);
+      if (table_scan->is_vec_adaptive_scan() || table_scan->is_vec_idx_scan_post_filter()) {
+        table_scan->set_rowkey_doc_table_id(tr_info.rowkey_idx_tid_);
+      }
+      if (OB_FAIL(table_scan->set_is_skip_rowkey_doc(tr_info.doc_id_idx_tid_ == OB_INVALID_ID))) {
+      } else if (OB_FAIL(table_scan->set_is_skip_rowkey_doc(tr_info.rowkey_idx_tid_ == OB_INVALID_ID))) {
+      }
     }
   }
 
@@ -12750,6 +12777,8 @@ int ObLogPlan::try_push_topn_into_text_retrieval_scan(ObLogicalOperator *&top,
     table_scan->get_text_retrieval_info().sort_key_.expr_ = sort_keys.at(0).expr_;
     table_scan->get_text_retrieval_info().sort_key_.order_type_ = sort_keys.at(0).order_type_;
     table_scan->get_text_retrieval_info().with_ties_ = (has_multi_sort_keys || is_fetch_with_ties);
+    // The documents are ordered by the match score, the relevance must be calculated.
+    table_scan->get_text_retrieval_info().need_calc_relevance_ = true;
     if (OB_FAIL(tmp_sort_keys.push_back(sort_keys.at(0)))) {
     } else if (OB_FAIL(table_scan->set_op_ordering(tmp_sort_keys))) {
     }

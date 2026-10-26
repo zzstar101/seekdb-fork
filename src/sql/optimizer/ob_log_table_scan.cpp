@@ -704,7 +704,9 @@ int ObLogTableScan::extract_pushdown_filters(ObIArray<ObRawExpr*> &nonpushdown_f
         } else if (is_vec_adaptive_scan()) {
           add_to_scan_filter = true;
         }
-      } else if (is_text_retrieval_scan() && need_text_retrieval_calc_relevance()) {
+      } else if (is_text_retrieval_scan()) {
+        // The filters of the full text retrieval scan are evaluated by the executor instead of
+        // being pushed down to the storage, no matter whether the relevance is calculated.
         if (OB_FAIL(nonpushdown_filters.push_back(filters.at(i)))) {
         } else if (is_vec_adaptive_scan()) {
           add_to_scan_filter = true;

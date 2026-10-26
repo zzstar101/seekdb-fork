@@ -12804,6 +12804,172 @@ bool ObTransformUtils::is_full_group_by(ObSelectStmt& stmt, ObSQLMode mode)
   return !stmt.has_order_by() && is_only_full_group_by_on(mode);
 }
 
+// check whether the expression tree rooted at root references target
+static bool expr_references_raw_expr(ObRawExpr *root, ObRawExpr *target)
+{
+  bool found = false;
+  if (nullptr != root) {
+    if (root == target) {
+      found = true;
+    } else {
+      for (int64_t i = 0; !found && i < root->get_param_count(); ++i) {
+        found = expr_references_raw_expr(root->get_param_expr(i), target);
+      }
+    }
+  }
+  return found;
+}
+
+// Check whether the match expression is referenced by the parts of the statement which
+// need the relevance score to be calculated.
+static int check_match_expr_referenced_by_stmt(ObDMLStmt *stmt,
+                                              ObRawExpr *match_expr,
+                                              bool &referenced)
+{
+  int ret = OB_SUCCESS;
+  referenced = false;
+  ObSelectStmt *select_stmt = nullptr;
+  if (OB_ISNULL(stmt) || OB_ISNULL(match_expr)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), KP(stmt), KP(match_expr));
+  } else if (OB_FALSE_IT(select_stmt = static_cast<ObSelectStmt*>(stmt))) {
+  } else {
+    for (int64_t i = 0; !referenced && i < select_stmt->get_select_item_size(); ++i) {
+      referenced = expr_references_raw_expr(select_stmt->get_select_item(i).expr_, match_expr);
+    }
+    for (int64_t i = 0; !referenced && i < select_stmt->get_aggr_item_size(); ++i) {
+      referenced = expr_references_raw_expr(select_stmt->get_aggr_item(i), match_expr);
+    }
+    for (int64_t i = 0; !referenced && i < select_stmt->get_group_exprs().count(); ++i) {
+      referenced = expr_references_raw_expr(select_stmt->get_group_exprs().at(i), match_expr);
+    }
+    for (int64_t i = 0; !referenced && i < select_stmt->get_rollup_exprs().count(); ++i) {
+      referenced = expr_references_raw_expr(select_stmt->get_rollup_exprs().at(i), match_expr);
+    }
+    for (int64_t i = 0; !referenced && i < select_stmt->get_having_exprs().count(); ++i) {
+      referenced = expr_references_raw_expr(select_stmt->get_having_exprs().at(i), match_expr);
+    }
+    for (int64_t i = 0; !referenced && i < stmt->get_order_item_size(); ++i) {
+      referenced = expr_references_raw_expr(stmt->get_order_item(i).expr_, match_expr);
+    }
+    for (int64_t i = 0; !referenced && i < select_stmt->get_window_func_count(); ++i) {
+      referenced = expr_references_raw_expr(select_stmt->get_window_func_expr(i), match_expr);
+    }
+    for (int64_t i = 0; !referenced && i < stmt->get_part_exprs().count(); ++i) {
+      referenced = expr_references_raw_expr(stmt->get_part_exprs().at(i).part_expr_, match_expr)
+                  || expr_references_raw_expr(stmt->get_part_exprs().at(i).subpart_expr_, match_expr);
+    }
+  }
+  return ret;
+}
+
+// Check whether the predicate which is pushed down into the full text retrieval scan only
+// uses the match expression as a boolean filter, in this case every document produced by
+// the scan satisfies the predicate and the relevance score is not required to evaluate it.
+// Only the following patterns are accepted:
+//   1. MATCH(...) AGAINST(...)                    -- boolean filter directly
+//   2. T_OP_BOOL(MATCH(...) AGAINST(...))         -- boolean conversion
+//   3. MATCH(...) AGAINST(...) > 0 / 0 < MATCH(...) AGAINST(...)
+static int check_match_pred_is_score_free(ObExecContext *exec_ctx,
+                                         ObRawExpr *match_pred,
+                                         ObRawExpr *match_expr,
+                                         bool &score_free,
+                                         ObIArray<ObExprConstraint> &constraints)
+{
+  int ret = OB_SUCCESS;
+  score_free = false;
+  ObRawExpr *left = nullptr;
+  ObRawExpr *right = nullptr;
+  if (OB_ISNULL(exec_ctx) || OB_ISNULL(match_pred) || OB_ISNULL(match_expr)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), KP(exec_ctx), KP(match_pred), KP(match_expr));
+  } else if (match_pred == match_expr) {
+    score_free = true;
+  } else if (T_OP_BOOL == match_pred->get_expr_type()) {
+    score_free = (1 == match_pred->get_param_count() && match_pred->get_param_expr(0) == match_expr);
+  } else if (T_OP_GT == match_pred->get_expr_type() || T_OP_LT == match_pred->get_expr_type()) {
+    bool is_zero = false;
+    if (OB_UNLIKELY(2 != match_pred->get_param_count())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected param count", K(ret), KPC(match_pred));
+    } else if (OB_ISNULL(left = match_pred->get_param_expr(0))
+               || OB_ISNULL(right = match_pred->get_param_expr(1))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected null param", K(ret), KPC(match_pred));
+    } else if ((T_OP_GT == match_pred->get_expr_type() && left != match_expr)
+               || (T_OP_LT == match_pred->get_expr_type() && right != match_expr)) {
+      // the match expression is compared as a range, e.g. MATCH(...) > 0.5, keep the score
+    } else if (OB_FAIL(ObTransformUtils::check_expr_eq_zero(
+                 exec_ctx,
+                 T_OP_GT == match_pred->get_expr_type() ? right : left,
+                 is_zero,
+                 constraints))) {
+      LOG_WARN("failed to check whether the expr is zero", K(ret));
+    } else {
+      score_free = is_zero;
+    }
+  }
+  return ret;
+}
+
+int ObTransformUtils::check_need_calc_match_score(ObExecContext *exec_ctx,
+                                                  const ObDMLStmt *stmt,
+                                                  ObRawExpr *match_expr,
+                                                  ObRawExpr *match_pred,
+                                                  bool &need_calc,
+                                                  ObIArray<ObExprConstraint> &constraints)
+{
+  int ret = OB_SUCCESS;
+  need_calc = true;
+  bool score_free = false;
+  bool referenced = false;
+  int64_t other_match_cond_cnt = 0;
+  ObDMLStmt *dml_stmt = const_cast<ObDMLStmt*>(stmt);
+  ObSelectStmt *select_stmt = nullptr;
+  if (OB_ISNULL(exec_ctx) || OB_ISNULL(stmt) || OB_ISNULL(match_expr) || OB_ISNULL(match_pred)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), KP(exec_ctx), KP(stmt), KP(match_expr), KP(match_pred));
+  } else if (!stmt->is_select_stmt()) {
+    // keep calculating the relevance score for non-select statements
+  } else if (T_FUN_MATCH_AGAINST != match_expr->get_expr_type()
+             || NATURAL_LANGUAGE_MODE
+                    != static_cast<ObMatchFunRawExpr *>(match_expr)->get_mode_flag()) {
+    // only the natural language mode is handled here. The other modes (the boolean mode for
+    // example) have extra matching rules, keep calculating the relevance score for them.
+  } else if (OB_FALSE_IT(select_stmt = static_cast<ObSelectStmt*>(dml_stmt))) {
+  } else if (stmt->has_limit() || stmt->get_order_item_size() > 0
+             || stmt->get_subquery_exprs().count() > 0) {
+    // 1. the output of a full text retrieval scan is ordered by the relevance score, the
+    //    score is required to keep the ordering of a limited query;
+    // 2. the score may be referenced by sub queries.
+    // keep calculating the relevance score to be safe.
+  } else if (OB_FAIL(check_match_pred_is_score_free(exec_ctx,
+                                                   match_pred,
+                                                   match_expr,
+                                                   score_free,
+                                                   constraints))) {
+    LOG_WARN("failed to check whether the match predicate is score free", K(ret));
+  } else if (!score_free) {
+    // the relevance score is required to evaluate the filter
+  } else {
+    // the match predicate should be the only predicate which references the match expression
+    for (int64_t i = 0; OB_SUCC(ret) && i < dml_stmt->get_condition_exprs().count(); ++i) {
+      ObRawExpr *cond = dml_stmt->get_condition_exprs().at(i);
+      if (nullptr != cond && cond != match_pred && expr_references_raw_expr(cond, match_expr)) {
+        ++other_match_cond_cnt;
+      }
+    }
+    if (OB_SUCC(ret) && other_match_cond_cnt > 0) {
+      // the match expression is referenced by other predicates, keep the score
+    } else if (OB_FAIL(check_match_expr_referenced_by_stmt(dml_stmt, match_expr, referenced))) {
+      LOG_WARN("failed to check whether the match expression is referenced", K(ret));
+    } else if (!referenced) {
+      need_calc = false;
+    }
+  }
+  return ret;
+}
+
 int ObTransformUtils::inner_check_need_calc_match_score(ObExecContext *exec_ctx,
                                                         ObRawExpr* expr, 
                                                         ObRawExpr* match_expr, 
