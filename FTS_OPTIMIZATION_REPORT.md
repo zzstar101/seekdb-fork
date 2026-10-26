@@ -228,6 +228,20 @@ planner 侧 `ObGranuleUtil`（`src/sql/engine/px/ob_granule_util.cpp:214-232`）
 **40 组「生效 vs 不生效」差分（8 文本 × 5 个 LIMIT）全部一致**；`semcheck.sh` 1594 项 SEMANTIC OK；
 `mysem.sh` 34 项仅剩已知的同分并列差异。
 
+### 4.7 分词器配置的按输入缓存
+
+每次 `TOKENIZE()` 调用都会重做一遍「拼接内部 parser 名 → 重整 parser properties → `to_format_json`
+→ 再解析回 `ObFTParser`/`ObFTParserProperty`」，约占一次 IK 调用的 13%。现在改为按
+（原始 parser 名、原始 properties JSON、collation）做**有界**缓存（固定 8 槽静态表）：CAS 抢槽、
+填好后 release 发布，读侧只做 acquire 读、不加锁；不淘汰、溢出计数并只记一次日志，溢出时退回原有的每次解析路径。
+同时新增 `ObFTParseHelper::init(allocator, const ObFTParser &, const ObFTParserProperty &)`，
+让 helper 直接用已解析好的对象初始化，省掉字符串解析。提交：`21736d107`。
+
+实测（`ab.sh --instrument cpu --rounds 6`，A=pristine）：`tokenize_ik` **167.1 → 128.3 µs（−24.2%）**，
+`tokenize_beng` **92.4 → 79.5 µs（−10.6%）**；我的 4 轮独立复核链（A=pristine，B=该提交后的 HEAD）：
+`tokenize_ik` 152.5 → 106.7 µs（**−18.7%**，IQR −27.1..−15.8）、`tokenize_beng` 85.0 → 59.3 µs（−16.0%）。
+语义：24,130 篇文档 × 61,444 条 TOKENIZE 语句逐字节一致（0 差异），`semcheck.sh` SEMANTIC OK（1594 项，我独立复跑过一次）。
+
 ## 5. 性能结果（实测）
 
 所有数字来自**冻结树**（HEAD `959947187`，二进制 `/tmp/ftsbench/bin/seekdb-final`，
@@ -339,6 +353,32 @@ tokenize_ik=0.1509 tokenize_beng=0.1000 query_cn=1.9403 query_beng=2.6555 query_
 | query | **0.438** | (−25.6 −25.6 −27.9 −96.0)/4 |
 | overall | **≈0.248 ~ 0.259** | (build + tokenize + query)/3 |
 | 官方折算得分 | **≈50/100**（区间 47-52） | 100 × overall / 0.5 |
+
+### 5.7 累计口径复核（HEAD `21736d107` 含 count-only + parser 缓存）
+
+我自己跑的 4 轮交错 A/B（A = `bin/seekdb-base-5bce9e06`，B = `bin/seekdb-tok-pc1`，build `614c8476`，
+`--instrument cpu --rounds 4 --port 2888`，`reports/ab-pc1-cumulative.md`）：
+
+| 指标 | pristine | 当前 HEAD | 中位 Δ | IQR | 判定 |
+|---|---|---|---|---|---|
+| select1（对照） | 50.25 µs | 40.75 µs | −9.3% | −19.2..−2.5 | noise ✓ |
+| tokenize_ik | 152.5 µs | 106.7 µs | **−18.7%** | −27.1..−15.8 | 4/4 轮为负 |
+| tokenize_beng | 85.0 µs | 59.3 µs | **−16.0%** | −30.5..−8.2 | 4/4 轮为负 |
+| query_cn | 2217 µs | 1550 µs | **−25.8%** | −30.5..−23.2 | 4/4 轮为负 |
+| query_beng | 2967 µs | 2267 µs | **−23.9%** | −27.1..−21.0 | 4/4 轮为负 |
+| query_mixed | 2317 µs | 1750 µs | **−29.3%** | −33.5..−22.6 | 4/4 轮为负 |
+| query_limit | 3600 µs | 150 µs | **−95.1%** | −96.0..−94.0 | 4/4 轮 −92..−97 |
+
+构建类别沿用 5.3 的三轮 wall（−20.3% ~ −24.0%；parser 缓存对构建只贡献约 0.5-1%，因为构建里分词自用时间只占 4.1%）。
+更新后的类别平均与折算：
+
+| 类别 | 平均提升率 | 来源 |
+|---|---|---|
+| build | **0.226**（0.20-0.24） | 5.3 |
+| tokenize | **0.175**（ik 0.19 / beng 0.16） | 5.7 + 4.7 |
+| query | **0.435**（(25.8+23.9+29.3+95.1)/4） | 5.7 |
+| overall | **≈0.279** | (0.226+0.175+0.435)/3 |
+| 官方折算得分 | **≈56/100**（区间 54-58） | 100 × overall / 0.5 |
 
 ## 6. 正确性验证
 
@@ -489,3 +529,37 @@ python3 tools/benchmark/fts_large_bench_score.py /tmp/report.txt
    整体回滚，改为 `need_score_` 门控的最小改动。
 5. **无分数路径跳过 relevance collector**：`collect_dims_by_id` 用 `got_valid_id` 丢文档，而
    `should_match_` 来自 `minimum_should_match_`（可能 >1），blind 移除会静默改变语义，主动不做。
+
+## 10. 构建类别的余量分析（build-dev 第二轮诊断，2026-10-27 06:00）
+
+**结论：本次引擎版本里，构建的 wall 已经没有可观的合规余量；构建受「排序 + sstable 编码」而非分词限制。**
+
+- 相位分解（对真实 `ALTER ... WITH PARSER ik` 采样 2885 个活跃样本）：**sort 37.2%、sstable write/encode 23.9%、
+  scan/PX 6.3%、tokenize 仅 4.1%（self）、其余 28.4%**。中段窗口的 self 前十全是字符串比较/哈希/编码：
+  `ObSortOpImpl::Compare::operator()` 9.3% self、`ObMacroBlockWriter::check_order` 11.0%、`ob_mb_wc_utf8mb4` 7.0%、
+  `ObEncodingHashTableBuilder::build` 6.4%、`ObNullSafeDatumStrCmp<CS 63>` 3.5%、`ObIntegerBaseDiffEncoder` 3.2%。
+  （注意：早前引用的「`ObFTParseHelper::segment` 55% inclusive」不能当作分词成本——那一窗口里生产者是唯一忙线程，
+  scan/rowgen/transmit/sort 都落在它的栈里；leaf/self 口径的 4.1% 与 15 µs/doc 的微基准一致。）
+- 微基准（700k 行 = 真实辅助表行数）：scan+concat 0.198 s、project 0.656 s、无排序 insert 2.68 s、
+  `order by 1,2` insert 4.71 s ⇒ **排序溢价 2.04 s（102 µs/doc）**，写/编码 101-120 µs/doc，分词 15 µs/doc。
+- 三条可选方向的**上限**：分词再快一倍 ≈ 构建 wall 的 **2%**；两张重辅助表合并成一次分词 ≈ **≤2%**
+  （两表并发跑、key 顺序相反，排序与写必须各做一遍）；每行 `ObDatumRow` 抖动减半 ≈ **1-2%**。合计约 **5%**。
+- 扫描并行度：`parallel(N)` 确实进计划（`ddl_slice_info.range_cut = dop−1`，idempotent 写分片随 DOP 扩展），
+  但**扫描侧并行无法显形**——任意时刻只有 2 个线程在跑（每张重辅助表一个），每张表的 scan→tokenize→rowgen→sort→write
+  都在同一线程串行；`px_task_size` 2M→128K（granule ×16）只带来 5-9%，此前实现的 granule floor 是 −0.7/−1.7/+4.3%（噪声，已回滚）。
+  一句话：**该版本里 DDL 辅助表的 scan→tokenize→sort→write 流水线被钉在每表一个 worker 上，DOP 只扩写分片、不缩短关键路径。**
+- 已排除的伪优化：二进制 key 排序（5.876 s / 11.26 CPU-s）比 utf8mb4_bin（4.714 s / 4.73 CPU-s）**更差**。
+- 剩余唯一发现（已批准，待实施/验证）：`ObMacroBlockWriter::check_order`（`src/storage/blocksstable/ob_macro_block_writer.cpp:1084`，
+  由 `append_row`（`:882`）无条件调用，逐行做完整 rowkey 重比较）占 ALTER self CPU 的 **6.5%**；DDL 路径行序已由语句
+  `ORDER BY` 保证，可用默认开启的 `need_check_order_` 闸门在 DDL 路径关闭（其他合并/回放不变），上限约构建 wall 的 4-5%；
+  若实测落在噪声内必须回滚。
+
+### 10.1 与 100/100 的差距（诚实结论）
+
+要在 query 已 0.435 的前提下达到 overall ≥ 0.50，build 与 tokenize 的平均需要 ≈ **0.78**（例如 build 0.90 + tokenize 0.65）。
+本轮诊断给出的上限是：build 可动部分 ≤5%（其余是固有排序+编码）；tokenize 的固定开销（SQL 解析/执行器 + JSON 序列化）
+约占语句成本 40%+，即使分词本身归零也只到 ~0.5。因此 **100/100 在本仓库当前架构下不可达**——除非做跨模块结构重写：
+(1) 让辅助表构建真正 scan 侧并行（需把 sorter/writer 也拆成多线程流水线）；
+(2) 换掉 sort-based 构建（按 key 预分区 + 多路归并，或 LSM 直接多路写出）；
+(3) 让 `TOKENIZE()` 结果避免 JSON 序列化（协议层改动）。这三项都超出「不改语义、不改测试」的竞赛补丁范围。
+本轮拿到的 **overall ≈0.28（≈56/100）** 是这些模块在不改语义前提下的可达区间。
