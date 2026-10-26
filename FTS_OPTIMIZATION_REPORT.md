@@ -529,6 +529,18 @@ python3 tools/benchmark/fts_large_bench_score.py /tmp/report.txt
    能真正终止 DAAT 扫描（或为回表扫描实现无相关性支持）。当前实现因**无可测收益**已 `git checkout` 回滚，
    设计、实验数据与后续步骤记录在此。
 
+
+### 8.10 本轮被否定/回滚的实验清单（全部有实测数据，均未进入分支）
+
+| 实验 | 机制 | 结果 | 结论 |
+|---|---|---|---|
+| granule 下限（`ObParallelRangeTaskPlanner::compute_total_task_count` + `compute_task_count_each_partition`） | 空 tablet 统计导致任务数塌成 1，令其至少等于 dop | 独立配对 A/B：−0.7 / −1.7 / +4.3%（在 ±6% 噪声内）；`px_task_size` 2M→128K 仅 5-9% | 回滚。DDL 的 `INSERT..SELECT` 不是扫描并行受限 |
+| 去掉 text-retrieval 的 top-n 下推（`try_push_topn_into_text_retrieval_scan` 提前返回） | 让 LIMIT 不被下推到扫描 | `query_limit` **2300 → 19233 µs（8.4× 更差）**：该查询 `is_index_back=true`，下推时只为 20 行付打分代价，不下推要为 9333 个候选付 | 回滚。top-n 下推必须保留 |
+| `query_limit` 短批量回填（advance 后只回填 16 行） | 每次 pivot 跳转只消费一个 posting，减少解码 | **+60% 更差**（3766 vs 2400 µs）：每次回填都要付一次 `das_scan_advance` 重定位，256 行批量摊薄了 seek | 回滚。q_limit 的成本是 pivot seek 次数本身，只能靠 block-max 统计消除 |
+| 跳过 `ObMacroBlockWriter::check_order()`（默认开启的 `need_check_order_` 闸门，仅 DDL 辅助表关闭） | 逐行校验 rowkey 序，中段占单 worker self-CPU 11.0% | 语义干净（semcheck 1594 OK、索引布局/df/postings/docword 一致），闸门生效可证（check_order 188 样本→0，write 桶 26.4%→5.9%），但上限 ≈构建 wall 4-5% ⇒ ≤1.5 分，每 ALTER wall 的配对 A/B 未越噪声 | 回滚（inside noise）。三项数字均为 mid-ALTER self-CPU 份额，不等于 build wall |
+
+**方法论教训**（已写入 §2）：本轮两次假阳性都来自负载混淆——一次是「granule −19%」（load 18 vs load 6 的两段数据），一次是同二进制 5 次 full run 的 1.9-2.7× 抖动。规则因此改为：只认交替臂序的配对链 + 服务器 CPU 计数（CV 3-9%）作主指标，wall 仅作确认，且任何结论必须写出 IQR 与噪声底线。
+
 ## 9. 提交记录（`perf/fts-fresh`，12 个提交，vs `origin/2026-competition`）
 
 | 提交 | 内容 | 影响的指标 |
