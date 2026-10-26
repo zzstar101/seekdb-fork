@@ -617,10 +617,10 @@ python3 tools/benchmark/fts_large_bench_score.py /tmp/report.txt
   都在同一线程串行；`px_task_size` 2M→128K（granule ×16）只带来 5-9%，此前实现的 granule floor 是 −0.7/−1.7/+4.3%（噪声，已回滚）。
   一句话：**该版本里 DDL 辅助表的 scan→tokenize→sort→write 流水线被钉在每表一个 worker 上，DOP 只扩写分片、不缩短关键路径。**
 - 已排除的伪优化：二进制 key 排序（5.876 s / 11.26 CPU-s）比 utf8mb4_bin（4.714 s / 4.73 CPU-s）**更差**。
-- 剩余唯一发现（已批准，待实施/验证）：`ObMacroBlockWriter::check_order`（`src/storage/blocksstable/ob_macro_block_writer.cpp:1084`，
-  由 `append_row`（`:882`）无条件调用，逐行做完整 rowkey 重比较）占 ALTER self CPU 的 **6.5%**；DDL 路径行序已由语句
-  `ORDER BY` 保证，可用默认开启的 `need_check_order_` 闸门在 DDL 路径关闭（其他合并/回放不变），上限约构建 wall 的 4-5%；
-  若实测落在噪声内必须回滚。
+- 曾评估并按规范关闭过的项：`ObMacroBlockWriter::check_order`（`src/storage/blocksstable/ob_macro_block_writer.cpp:1084`，
+  由 `append_row`（`:882`）无条件调用，逐行做完整 rowkey 重比较）占中段单 worker self CPU 的 **11.0%**；实现为默认开启的
+  `need_check_order_` 闸门、仅 DDL 辅助表路径关闭，语义验证干净（semcheck 1594、布局/df/postings/docword 一致），
+  但上限只有构建 wall 的 4-5%（≤1.5 分）且配对 A/B 未越噪声 ⇒ **已回滚**，详见 §8.10 第 4 行。
 
 ### 10.1 与 100/100 的差距（诚实结论）
 
@@ -631,3 +631,57 @@ python3 tools/benchmark/fts_large_bench_score.py /tmp/report.txt
 (2) 换掉 sort-based 构建（按 key 预分区 + 多路归并，或 LSM 直接多路写出）；
 (3) 让 `TOKENIZE()` 结果避免 JSON 序列化（协议层改动）。这三项都超出「不改语义、不改测试」的竞赛补丁范围。
 本轮拿到的 **overall ≈0.26（≈52/100，区间 49-56）** 是这些模块在不改语义前提下的可达区间。
+
+### 10.2 第二阶段的并发与计划证据（build-dev，2026-10-27 07:40，HEAD `cbf79b791`+已提交 dop）
+
+**最重要的新证据是 DDL 内层 SQL 的权威计划形状**（用同 hint、同列、同目标表形状的等价语句 `EXPLAIN` 得到）：
+
+```
+PX COORDINATOR                                         (dop=5)
+ └─EXCHANGE OUT DISTR :EX10002
+   └─INSERT
+     └─OPTIMIZER STATS GATHER
+       └─EXCHANGE IN DISTR
+         └─EXCHANGE OUT DISTR (RANDOM) :EX10001  dop=1 is_single   ← 单线程流
+           └─MATERIAL                                              ← 全量物化
+             └─SUBPLAN SCAN ANONYMOUS_VIEW1
+               └─EXCHANGE IN MERGE SORT DISTR                       ← 唯一的全局归并
+                 └─EXCHANGE OUT DISTR :EX10000  dop=5
+                   └─SORT                                            ← worker 本地排序
+                     └─PX BLOCK ITERATOR
+                       └─TABLE FULL SCAN docs partitions(p0) range(MIN;MAX)
+```
+
+由此可以定案三件事：
+
+1. **扫描阶段受 granule 数限制，不受 dop 限制。** 单 tablet 的全扫描挂在 `PX BLOCK ITERATOR` 下，granule 数 =
+   f(数据量 / `px_task_size`)：20 000 行 ≈ 5 MB ÷ 2 MB ⇒ **2 个 granule**，所以真正参与 scan→tokenize→rowgen 的
+   只有 2 个 worker（1 s 窗口实测恰好 2 个忙线程、CPU 均分 52/52、69/69、62/60）；dop 只是把写分片扩到 `range_cut = dop−1`。
+   这与「granule floor + `px_task_size` 2M→128K 仅 5-9%」的既有结论互相印证：**扫描并行不是被计划挡住的，是被数据量/粒度挡住的**。
+2. **写阶段被计划形状钉成单线程。** 有序流经 `SUBPLAN SCAN → MATERIAL → EXCHANGE OUT DISTR (RANDOM) dop=1 is_single`
+   才进入 INSERT：整条流先被单线程物化、再单线程喂给写算子；`OPTIMIZER STATS GATHER` 又在上面过一遍全部行。任何 dop 都缩短不了这一段。
+3. **墙钟时间线（ALTER#1，新载 20 000 行，1 s 窗口，load 18，wall 16.2 s / CPU 15.2 s，8 个可解析窗口）：**
+   - 前 ~4 s：**2 个忙线程**（scan/PX 22-43%、tokenize 15-45%、other 32-36%）——scan+tokenize+rowgen；
+   - 中段 ~1 s：**5 个忙线程**（字符比较 45%、编码写 22%）——本地排序 + 分片写突发；
+   - 尾部 ~3 s：**1 个忙线程**——`ObTabletSliceWriter::append_row` 占该窗口 112/144 样本（`ObMicroBlockEncoder`、
+     `ObEncodingHashTableBuilder`、`crc64_sse42` 单帧 18%、`cal_row_checksum`、`ObBM25ParamAggregator::eval`）。
+   聚合 self：other 35.5%、字符比较 22.0%、编码写 18.5%、scan+PX 13.5%、tokenize 10.6%。
+
+补充实测与两条新的死路：
+
+- **SQL 层的排序很便宜，不能算作成本**：内层 SQL 实际只有 20 000 行（词行扩展发生在 DAS domain-insert 侧，~700 k 词行），
+  等价语句 `insert … select … order by 1,2` 0.25-0.36 s vs 无 order by 0.21 s ⇒ 排序溢价 ~50-120 ms（构建 wall 的 2-4%）。
+  因此采样里的 `ob_strnncollsp_utf8mb4`/`ObCharset::strcmpsp`（22%）来自**词行流水线的字符比较**（词典匹配、词表、切片路由），不是 SQL sorter。
+- **每张重辅助表的墙钟（并发提交、同一时刻起跑）**：ALTER#2 `fti_content_ik`（load 6.6-18.3，wall 17.96 s / CPU 12.4 s）
+  为 `__idx_…_fti_content_ik` 12.62 s + `_fts_doc_word` 15.54 s；ALTER#3 `fti_en_beng`（load 7.2，wall 6.22 s / CPU 5.73 s）
+  为 4.89 s / 5.60 s。⇒ 每个 ALTER 的 wall ≈ 较慢的那张表，两张表**互相抢同一批 worker**。
+- 死路 A：`opt_param('enable_newsort','false')` 对 varchar sort key 本来无效——`ObOrderPerservingEncoder::can_encode_sortkey`
+  （`src/data_plane/api/data_plane/ob_order_perserving_encoder.h:118-142`）只接受整数/数值/日期/char 类型。
+- 死路 B：`OPTIMIZER STATS GATHER` 无法从 DDL SQL 关掉——它由
+  `ObDelUpdLogPlan::allocate_optimizer_stats_gathering_as_top`（`src/sql/optimizer/ob_del_upd_log_plan.cpp:917-950`）在 PDML
+  builder 传非空 `osg_info` 时装配，没有 session/config 开关（`grep need_optimizer_stats_gathering|enable_optimizer_stats` 为空）。
+
+**对 (a)/(b)/(c) 的 final 判定：** (a) 砍冗余扫描 = **死**（granule 互不重叠、CPU-s 与 dop 无关、`px_task_size` 已证伪）；
+(b) 更便宜的归并 / 按分片直写 = **唯一还有量级的地方，但由 PDML 计划形状（MATERIAL + dop=1 单流 + QC 归并）决定，
+属 `src/sql/optimizer/**`（Lead 范围）**，DDL 侧能做的最多是换内层 SQL 的形状（先按 key 分片路由、再各分片自排自写），需要优化器配合；
+(c) 并行 sorter = 在 (b) 之前不值得，收益上限被 §10 的 ≤5% 结论压住。
