@@ -32,6 +32,8 @@ namespace oceanbase
 {
 namespace storage
 {
+struct ObFTDAT;
+
 class ObFTRangeDict final : public ObIFTDict
 {
 public:
@@ -62,6 +64,11 @@ public:
 
 public:
   int build_dict_from_cache(const ObFTCacheRangeContainer &range_container);
+
+  // Build an immutable range dict on top of already materialized dictionary
+  // blocks. The caller keeps ownership of the memory of every block and must
+  // keep it alive and unmodified while this dict is in use.
+  int build_dict_from_dat_blocks(const common::ObIArray<ObFTDAT *> &dat_blocks);
 
   static int try_load_cache(const ObFTDictDesc &desc,
                             const uint32_t range_count,

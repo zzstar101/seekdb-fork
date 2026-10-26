@@ -53,7 +53,8 @@ public:
         cache_stop_(allocator),
         dict_main_(nullptr),
         dict_quan_(nullptr),
-        dict_stop_(nullptr)
+        dict_stop_(nullptr),
+        owns_dicts_(false)
   {
   }
 
@@ -115,9 +116,12 @@ private:
   ObFTCacheRangeContainer cache_quan_;
   ObFTCacheRangeContainer cache_stop_;
 
+  // Either built per call (owns_dicts_ == true) or borrowed read-only views
+  // owned by the dict hub and shared by every parser of that charset.
   ObIFTDict *dict_main_;
   ObIFTDict *dict_quan_;
   ObIFTDict *dict_stop_;
+  bool owns_dicts_;
 
   DISABLE_COPY_ASSIGN(ObIKFTParser);
 };

@@ -415,6 +415,40 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict 
   return ret;
 }
 
+int ObFTRangeDict::build_dict_from_dat_blocks(const common::ObIArray<ObFTDAT *> &dat_blocks)
+{
+  int ret = OB_SUCCESS;
+  if (is_inited_) {
+    ret = OB_INIT_TWICE;
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < dat_blocks.count(); ++i) {
+    ObFTCacheDict *dict = nullptr;
+    ObFTDAT *dat = dat_blocks.at(i);
+    if (OB_ISNULL(dat)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected null dict block", K(ret), K(i));
+    } else if (OB_ISNULL(dict = OB_NEWx(ObFTCacheDict,
+                                        &range_alloc_,
+                                        ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                                        dat))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to allocate cache dict", K(ret));
+    } else {
+      ObFTRange range;
+      range.start_ = dat->start_word_;
+      range.end_ = dat->end_word_;
+      range.dict_ = dict;
+      if (OB_FAIL(range_dicts_.push_back(range))) {
+        LOG_WARN("failed to push back range", K(ret));
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    is_inited_ = true;
+  }
+  return ret;
+}
+
 int ObFTRangeDict::build_dict_from_cache(const ObFTCacheRangeContainer &range_container)
 {
   int ret = OB_SUCCESS;

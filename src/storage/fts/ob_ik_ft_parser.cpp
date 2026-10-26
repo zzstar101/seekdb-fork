@@ -256,20 +256,49 @@ int ObIKFTParser::init_dict(const ObFTParserParam &param)
                                   ObCharsetType::CHARSET_UTF8MB4,
                                   ObCollationType::CS_TYPE_UTF8MB4_BIN);
 
-  if (should_read_newest_table()) {
-    // clear dict cache, always false now
+  bool use_shared_dicts = false;
+  if (OB_FAIL(ret)) {
+  } else if (!should_read_newest_table()) {
+    // The built-in dictionaries never change within a query, so borrow the
+    // immutable views owned by the hub instead of rebuilding them per call.
+    int tmp_ret = hub_->get_builtin_ik_dicts(ObCharset::charset_type(param.cs_->name),
+                                             coll_type_,
+                                             dict_main_,
+                                             dict_quan_,
+                                             dict_stop_);
+    if (OB_SUCCESS == tmp_ret) {
+      use_shared_dicts = true;
+      owns_dicts_ = false;
+    } else if (OB_SIZE_OVERFLOW == tmp_ret) {
+      // every view slot is taken and a published view is never evicted, so this
+      // parser builds its own dictionaries for the call; the hub counts it.
+      dict_main_ = nullptr;
+      dict_quan_ = nullptr;
+      dict_stop_ = nullptr;
+    } else {
+      LOG_WARN("failed to get shared ik dicts, build per call dicts instead", K(tmp_ret));
+      dict_main_ = nullptr;
+      dict_quan_ = nullptr;
+      dict_stop_ = nullptr;
+    }
+  }
+
+  if (OB_FAIL(ret) || use_shared_dicts) {
+    // already logged.
   } else {
     if (OB_FAIL(init_single_dict(main_dict_desc, cache_main_))) {
     } else if (OB_FAIL(init_single_dict(quan_dict_desc, cache_quan_))) {
     } else if (OB_FAIL(init_single_dict(stopword_dict_desc, cache_stop_))) {
     }
-  }
 
-  if (OB_FAIL(ret)) {
-    // already logged.
-  } else if (OB_FAIL(build_dict_from_cache(main_dict_desc, cache_main_, dict_main_))) {
-  } else if (OB_FAIL(build_dict_from_cache(quan_dict_desc, cache_quan_, dict_quan_))) {
-  } else if (OB_FAIL(build_dict_from_cache(stopword_dict_desc, cache_stop_, dict_stop_))) {
+    if (OB_FAIL(ret)) {
+      // already logged.
+    } else if (OB_FAIL(build_dict_from_cache(main_dict_desc, cache_main_, dict_main_))) {
+    } else if (OB_FAIL(build_dict_from_cache(quan_dict_desc, cache_quan_, dict_quan_))) {
+    } else if (OB_FAIL(build_dict_from_cache(stopword_dict_desc, cache_stop_, dict_stop_))) {
+    } else {
+      owns_dicts_ = true;
+    }
   }
 
   return ret;
@@ -382,18 +411,25 @@ void ObIKFTParser::reset()
   cache_quan_.reset();
   cache_stop_.reset();
 
-  if (!OB_ISNULL(dict_main_)) {
-    dict_main_->~ObIFTDict();
-    allocator_.free(dict_main_);
+  // dicts borrowed from the hub are shared and must not be freed here
+  if (owns_dicts_) {
+    if (!OB_ISNULL(dict_main_)) {
+      dict_main_->~ObIFTDict();
+      allocator_.free(dict_main_);
+    }
+    if (!OB_ISNULL(dict_quan_)) {
+      dict_quan_->~ObIFTDict();
+      allocator_.free(dict_quan_);
+    }
+    if (!OB_ISNULL(dict_stop_)) {
+      dict_stop_->~ObIFTDict();
+      allocator_.free(dict_stop_);
+    }
   }
-  if (!OB_ISNULL(dict_quan_)) {
-    dict_quan_->~ObIFTDict();
-    allocator_.free(dict_quan_);
-  }
-  if (!OB_ISNULL(dict_stop_)) {
-    dict_stop_->~ObIFTDict();
-    allocator_.free(dict_stop_);
-  }
+  dict_main_ = nullptr;
+  dict_quan_ = nullptr;
+  dict_stop_ = nullptr;
+  owns_dicts_ = false;
 
   is_inited_ = false;
 }
