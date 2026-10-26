@@ -41,6 +41,10 @@ public:
   int hash(uint64_t &hash_val) const;
   const common::ObDatum &get_datum() const;
   int from_datum(const common::ObDatum &datum);
+  // Fast version of from_datum() for the hot path. The document ids of the inverted
+  // index are fixed length values which are always carried inside the datum itself,
+  // so the generic deep copy machinery can be replaced by a single memory copy.
+  int set_datum_fast(const common::ObDatum &datum);
   int from_obj(const common::ObObj &obj);
 
   ObDocIdExt &operator=(const ObDocIdExt &other);

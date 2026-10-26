@@ -220,7 +220,7 @@ int ObSRBMWIterImpl::process_collected_row(const ObDatum &id_datum, const double
   if (OB_UNLIKELY(top_k_heap_.count() > top_k_count_)) {
     ret = OB_ERR_UNEXPECTED;
   } else if (top_k_heap_.count() < top_k_count_) {
-    if (OB_FAIL(id_cache_.at(top_k_heap_.count()).from_datum(id_datum))) {
+    if (OB_FAIL(id_cache_.at(top_k_heap_.count()).set_datum_fast(id_datum))) {
     } else if (OB_FAIL(top_k_heap_.push(TopKItem(relevance, top_k_heap_.count())))) {
     }
   } else {
@@ -228,7 +228,7 @@ int ObSRBMWIterImpl::process_collected_row(const ObDatum &id_datum, const double
     const double top_k_threshold = get_top_k_threshold();
     if (relevance <= top_k_threshold) {
       // not a new top k candidate
-    } else if (OB_FAIL(id_cache_.at(cache_idx).from_datum(id_datum))) {
+    } else if (OB_FAIL(id_cache_.at(cache_idx).set_datum_fast(id_datum))) {
     } else if (OB_FAIL(top_k_heap_.pop())) {
     } else if (OB_FAIL(top_k_heap_.push(TopKItem(relevance, cache_idx)))) {
     }

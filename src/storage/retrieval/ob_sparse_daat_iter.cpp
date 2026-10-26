@@ -25,6 +25,7 @@ namespace storage
 
 ObSRMergeCmp::ObSRMergeCmp()
   : cmp_func_(nullptr),
+    cmp_mode_(CMP_MODE_GENERIC),
     iter_ids_(nullptr),
     is_inited_(false)
 {
@@ -44,6 +45,16 @@ int ObSRMergeCmp::init(
     if (OB_ISNULL(cmp_func_)) {
       ret = OB_ERR_UNEXPECTED;
     } else {
+      // The document id is a fixed length key: an unsigned integer is compared as an integer and a
+      // binary string is compared with memcmp, which is exactly what the binary collation does.
+      // Every other case, including a null document id, keeps using the generic comparator.
+      if (common::ObUInt64Type == id_meta.type_) {
+        cmp_mode_ = CMP_MODE_UINT64;
+      } else if (common::CS_TYPE_BINARY == id_meta.cs_type_ && common::ob_is_string_type(id_meta.type_)) {
+        cmp_mode_ = CMP_MODE_BINARY;
+      } else {
+        cmp_mode_ = CMP_MODE_GENERIC;
+      }
       is_inited_ = true;
     }
   }
@@ -59,11 +70,9 @@ int ObSRMergeCmp::cmp(
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
   } else {
-    int tmp_ret = 0;
-    if (OB_FAIL(cmp_func_(
-            get_id_datum(l.iter_idx_), get_id_datum(r.iter_idx_), tmp_ret, nullptr))) {
-    } else {
-      cmp_ret = tmp_ret;
+    // the document id comparison is the hottest operation of the merge, so a fixed length document
+    // id is compared directly instead of going through the generic collation comparator
+    if (OB_FAIL(cmp_id(get_id_datum(l.iter_idx_), get_id_datum(r.iter_idx_), cmp_ret))) {
     }
   }
   return ret;
@@ -82,7 +91,8 @@ ObSRDaaTIterImpl::ObSRDaaTIterImpl()
     buffered_relevances_(),
     next_round_iter_idxes_(),
     next_round_cnt_(0),
-    set_datum_func_(nullptr)
+    set_datum_func_(nullptr),
+    need_score_(true)
 {
 }
 
@@ -102,6 +112,14 @@ int ObSRDaaTIterImpl::init(
     iter_param_ = &iter_param;
     dim_iters_ = &dim_iters;
     relevance_collector_ = &relevance_collector;
+    // the relevance of a dimension is only required if the query really consumes it: it is
+    // projected, it is used by the score filter, or it is used by the topk (dynamic pruning)
+    // processing. Otherwise the dimension score is replaced by a constant positive value, which
+    // means "this document is contained by this dimension".
+    need_score_ = iter_param_->relevance_expr_ != nullptr
+        || iter_param_->need_project_relevance()
+        || iter_param_->need_filter()
+        || iter_param_->need_pushdown_topk();
     const int64_t max_batch_size = OB_MAX(iter_param_->eval_ctx_->max_batch_size_, iter_param_->max_batch_size_);
     if (iter_param_->id_proj_expr_->datum_meta_.type_ == common::ObUInt64Type) {
       set_datum_func_ = ObISparseRetrievalMergeIter::set_datum_int;
@@ -198,6 +216,37 @@ void ObSRDaaTIterImpl::reuse(const bool switch_tablet)
     return ret;
   }
 
+int ObSRMergeCmp::cmp_id(const ObDatum &l, const ObDatum &r, int64_t &cmp_ret)
+{
+  int ret = OB_SUCCESS;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+  } else if (OB_UNLIKELY(l.is_null() || r.is_null()) || CMP_MODE_GENERIC == cmp_mode_) {
+    int cmp_res = 0;
+    if (OB_FAIL(cmp_func_(l, r, cmp_res, nullptr))) {
+    } else {
+      cmp_ret = (cmp_res < 0) ? -1 : (cmp_res > 0 ? 1 : 0);
+    }
+  } else if (CMP_MODE_UINT64 == cmp_mode_) {
+    const uint64_t left = l.get_uint64();
+    const uint64_t right = r.get_uint64();
+    cmp_ret = (left < right) ? -1 : (left > right ? 1 : 0);
+  } else {
+    const common::ObString &left = l.get_string();
+    const common::ObString &right = r.get_string();
+    const int64_t min_len = MIN(left.length(), right.length());
+    const int cmp_res = (0 == min_len) ? 0 : MEMCMP(left.ptr(), right.ptr(), min_len);
+    if (0 != cmp_res) {
+      cmp_ret = (cmp_res < 0) ? -1 : 1;
+    } else if (left.length() == right.length()) {
+      cmp_ret = 0;
+    } else {
+      cmp_ret = (left.length() < right.length()) ? -1 : 1;
+    }
+  }
+  return ret;
+}
+
 int ObSRDaaTIterImpl::get_next_row()
 {
   int ret = OB_SUCCESS;
@@ -248,6 +297,7 @@ int ObSRDaaTIterImpl::get_next_rows(const int64_t capacity, int64_t &count)
   return ret;
 }
 
+
 int ObSRDaaTIterImpl::pre_process()
 {
   return OB_NOT_IMPLEMENT;
@@ -286,7 +336,11 @@ int ObSRDaaTIterImpl::fill_merge_heap()
       } else {
         ret = OB_SUCCESS;
       }
-    } else if (OB_FAIL(dim_iter->get_curr_score(item.relevance_))) {
+    } else if (!need_score() && FALSE_IT(item.relevance_ = 1.0)) {
+      // The relevance of this query is not consumed, so the score of the dimension is never
+      // evaluated. A constant positive value keeps the "the document is contained by this
+      // dimension" semantic expected by the relevance collector.
+    } else if (need_score() && OB_FAIL(dim_iter->get_curr_score(item.relevance_))) {
     } else if (OB_NOT_NULL(iter_param_->dim_weights_) && FALSE_IT(item.relevance_ = item.relevance_ * iter_param_->field_boost_ * iter_param_->dim_weights_->at(iter_idx))) {
     } else if (OB_FAIL(dim_iter->get_curr_id(iter_domain_ids_[iter_idx]))) {
     } else if (FALSE_IT(item.iter_idx_ = iter_idx)) {
@@ -396,8 +450,10 @@ int ObSRDaaTIterImpl::cache_result(int64_t &count, const ObDatum &id_datum, cons
   } else if (OB_UNLIKELY(count >= buffered_domain_ids_.count() || count >= buffered_relevances_.count())) {
     ret = OB_INVALID_ARGUMENT;
   } else {
-    buffered_domain_ids_[count].from_datum(id_datum);
-    buffered_relevances_[count] = relevance;
+    if (OB_FAIL(buffered_domain_ids_[count].set_datum_fast(id_datum))) {
+    } else if (need_score()) {
+      buffered_relevances_[count] = relevance;
+    }
     ++count;
     ++output_row_cnt_;
     if (limit_param->is_valid() && output_row_cnt_ >= limit) {
@@ -441,9 +497,11 @@ int ObSRDaaTIterImpl::project_results(const int64_t count)
     ObDatum &id_proj_datum = id_proj_expr->locate_datum_for_write(*eval_ctx);
     set_datum_func_(id_proj_datum, buffered_domain_ids_[0]);
     id_proj_expr->set_evaluated_projected(*eval_ctx);
-    ObDatum &relevance_proj_datum = relevance_proj_expr->locate_datum_for_write(*eval_ctx);
-    relevance_proj_datum.set_double(buffered_relevances_[0]);
-    relevance_proj_expr->set_evaluated_projected(*eval_ctx);
+    if (iter_param_->need_project_relevance()) {
+      ObDatum &relevance_proj_datum = relevance_proj_expr->locate_datum_for_write(*eval_ctx);
+      relevance_proj_datum.set_double(buffered_relevances_[0]);
+      relevance_proj_expr->set_evaluated_projected(*eval_ctx);
+    }
   }
   return ret;
 }

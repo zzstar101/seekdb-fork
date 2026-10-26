@@ -72,6 +72,15 @@ int ObTextTaaTIter::pre_process()
       const int64_t total_doc_cnt = bm25_param_estimator_.get_total_doc_cnt();
       partition_cnt_ = MIN((total_doc_cnt-1) / OB_HASHMAP_DEFAULT_SIZE + 1, OB_MAX_HASHMAP_COUNT);
     }
+  } else {
+    // The relevance is not consumed by this query, so the bm25 parameters are never estimated, but
+    // the hash map partitions used to aggregate the per document relevance are still needed to
+    // produce rows. The estimation context is guaranteed to hold a positive document count.
+    const int64_t total_doc_cnt = MAX(bm25_param_estimator_.get_estimated_total_doc_cnt(), 1);
+    partition_cnt_ = (total_doc_cnt - 1) / OB_HASHMAP_DEFAULT_SIZE + 1;
+    if (OB_UNLIKELY(partition_cnt_ > OB_MAX_HASHMAP_COUNT)) {
+      partition_cnt_ = OB_MAX_HASHMAP_COUNT;
+    }
   }
   return ret;
 }

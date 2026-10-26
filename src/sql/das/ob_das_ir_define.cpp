@@ -229,6 +229,21 @@ int ObDocIdExt::from_obj(const ObObj &obj)
   return ret;
 }
 
+int ObDocIdExt::set_datum_fast(const ObDatum &datum)
+{
+  int ret = common::OB_SUCCESS;
+  if (OB_UNLIKELY(datum.is_null() || datum.len_ < 0 || datum.len_ > OB_DOC_ID_EXT_SIZE)) {
+    ret = from_datum(datum);
+  } else if (0 == datum.len_) {
+    datum_ = datum;
+  } else {
+    MEMCPY(buf_, datum.ptr_, datum.len_);
+    datum_ = datum;
+    datum_.ptr_ = buf_;
+  }
+  return ret;
+}
+
 int ObDocIdExt::from_datum(const ObDatum &datum)
 {
   int ret = common::OB_SUCCESS;

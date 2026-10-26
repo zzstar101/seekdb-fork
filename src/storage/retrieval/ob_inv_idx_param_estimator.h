@@ -77,6 +77,9 @@ public:
   int do_estimation(sql::ObEvalCtx &eval_ctx);
   int64_t get_total_doc_cnt() const { return total_doc_cnt_; }
   double get_avg_doc_token_cnt() const { return avg_doc_token_cnt_; }
+  // The document count of the estimation context. It is available even when the estimation is
+  // never performed because the relevance is not required by the query.
+  int64_t get_estimated_total_doc_cnt() const { return est_ctx_.estimated_total_doc_cnt_; }
   bool is_estimated() const { return estimated_; }
 private:
   ObBM25ParamEstCtx est_ctx_;
