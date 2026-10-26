@@ -393,6 +393,26 @@ python3 tools/benchmark/fts_large_bench_score.py /tmp/report.txt
 7. **回表限制**：`is_index_back=true` 的全文扫描必须保留相关性（回表路径只按"带相关性的 children 数组"实现）。这是本次调试中发现的既有约束，已用"回表则不加优化"的方式保守处理。
 8. **量化证据的边界**：单次运行的噪声极大（同一 binary 的 query_cn 在 1.55-3.10 ms 之间浮动，构建 1.6-8.1 s），所有结论都基于交错 A/B 的中位数与配对检验；构建类指标在负载 >25 时不可分辨，本报告对构建类的结论标注为"该负载下无法分辨"。
 
+9. **`query_limit` 的 count-only 优化（已实现、计划层生效、实测无收益、已回滚）**：`query_limit` 的 SQL 形如
+   `SELECT COUNT(*) FROM (SELECT id ... LIMIT 20) t`，而 `LIMIT n` 无 OFFSET/WITH TIES 时行数恒为
+   `min(n, 匹配行数)`，与行序无关，因此外层的 `COUNT(*)` 让内层的"相关性排序 + 相关性分数"不可观测。据此实现：
+   `ObSelectStmt::is_count_only_output()` 标记 + `ObTransformUtils::mark_count_only_output()`
+   （挂在 `ObTransformerImpl::do_transform`，此时 `transform_heuristic_rule` 在本分支已是死代码）识别
+   `count(*)` over 单个 from 子查询、并清空子查询的 order items；消费点在
+   `ObLogPlan::try_push_topn_into_text_retrieval_scan()`（count-only 时不做 topn 下推）与
+   `ObTransformUtils::check_need_calc_match_score()`（count-only 时允许带 LIMIT 走无相关性路径）。
+   实测结果分两半：
+   - **计划层完全按设计生效**：`EXPLAIN` 的估算耗时从 406225 us 降到 613 us，`sort_keys(...)` 消失，
+     只保留 `limit(20)`；结果全部正确（`LIMIT 20`→20、`LIMIT 5`→5、`LIMIT 100000`→6667、不匹配词→0）。
+   - **但服务端 CPU 没有下降**：co4（含该改动）`query_limit` 3000-3550 us，pristine 2950-3200 us；
+     而且成本对 LIMIT 完全不敏感（LIMIT 1/20/200/100000 = 3550/3500/3800/25850 us）⇒ 下推的 `limit(20)`
+     并没有让倒排扫描提前结束；同时子查询投影了 `id`，强制 `is_index_back=true`，而按第 7 条约束
+     回表路径必须保留相关性 ⇒ 仍然按"打分路径"扫完全部 9333 个 posting。
+   结论/下一步（要拿到 −80% 以上需要同时补两块）：(a) count-only 时把子查询的选择列改写成常量，
+   从而不需要回表（`access(nil)`，`is_index_back=false`）并允许走无相关性扫描；(b) 让下推的 limit
+   能真正终止 DAAT 扫描（或为回表扫描实现无相关性支持）。当前实现因**无可测收益**已 `git checkout` 回滚，
+   设计、实验数据与后续步骤记录在此。
+
 ## 9. 提交记录（`perf/fts-fresh`，12 个提交，vs `origin/2026-competition`）
 
 | 提交 | 内容 | 影响的指标 |
