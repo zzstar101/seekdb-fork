@@ -81,11 +81,24 @@ public:
   int check_stopword(const ObFTWord &word, bool &is_stopword);
 
 private:
+  // The builtin stop word list is made of lower case ascii words only, so a word made
+  // of ascii characters can be matched by a plain byte comparison instead of a charset
+  // conversion followed by a collation aware hash lookup.
+  int build_ascii_cache();
+  OB_INLINE bool in_ascii_cache(const char *word, const int64_t word_len) const;
+  OB_INLINE bool try_check_ascii_stopword(const ObFTWord &word, bool &is_stopword) const;
+
+private:
   static const int64_t DEFAULT_STOPWORD_BUCKET_NUM = 37L;
   typedef common::hash::ObHashSet<storage::ObFTWord> StopWordSet;
 
   StopWordSet stopword_set_;
   ObObjMeta stopword_type_;
+  // Sorted by (length, bytes) so that a lookup is a binary search, duplicates removed.
+  char ascii_cache_[DEFAULT_STOPWORD_BUCKET_NUM][FTS_STOP_WORD_MAX_LENGTH];
+  int8_t ascii_cache_len_[DEFAULT_STOPWORD_BUCKET_NUM];
+  int64_t ascii_cache_cnt_ = 0;
+  bool ascii_cache_valid_ = false;
 
   bool inited_ = false;
 

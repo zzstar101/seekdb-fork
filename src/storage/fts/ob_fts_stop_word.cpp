@@ -56,17 +56,142 @@ int ObStopWordChecker::init()
       }
     }
 
-    if (OB_SUCC(ret)) {
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(build_ascii_cache())) {
+    } else {
       inited_ = true;
     }
   }
   return ret;
 }
 
+int ObStopWordChecker::build_ascii_cache()
+{
+  int ret = OB_SUCCESS;
+  ascii_cache_cnt_ = 0;
+  ascii_cache_valid_ = false;
+  const int64_t stopword_count = sizeof(ob_stop_word_list) / sizeof(ob_stop_word_list[0]);
+  for (int64_t i = 0; OB_SUCC(ret) && i < stopword_count; ++i) {
+    const char *word = ob_stop_word_list[i];
+    const int64_t word_len = STRLEN(word);
+    bool is_lower_ascii = (word_len <= FTS_STOP_WORD_MAX_LENGTH);
+    for (int64_t j = 0; is_lower_ascii && j < word_len; ++j) {
+      if (!ob_isascii(word[j]) || (word[j] >= 'A' && word[j] <= 'Z')) {
+        is_lower_ascii = false;
+      }
+    }
+    if (OB_UNLIKELY(!is_lower_ascii)) {
+      // A stop word that is not lower case ascii can not be matched by the fast path, so
+      // disable the fast path instead of building an incomplete cache.
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      // keep the cache sorted by (length, bytes) and skip the duplicated entries
+      int64_t pos = 0;
+      bool dup = false;
+      while (pos < ascii_cache_cnt_ && !dup) {
+        const int64_t cmp_len = ascii_cache_len_[pos];
+        const int64_t cmp = (word_len != cmp_len)
+                            ? (word_len < cmp_len ? -1 : 1)
+                            : MEMCMP(word, ascii_cache_[pos], word_len);
+        if (0 == cmp) {
+          dup = true;
+        } else if (cmp < 0) {
+          break;
+        } else {
+          ++pos;
+        }
+      }
+      if (!dup) {
+        for (int64_t k = ascii_cache_cnt_; k > pos; --k) {
+          MEMCPY(ascii_cache_[k], ascii_cache_[k - 1], FTS_STOP_WORD_MAX_LENGTH);
+          ascii_cache_len_[k] = ascii_cache_len_[k - 1];
+        }
+        MEMCPY(ascii_cache_[pos], word, word_len);
+        ascii_cache_len_[pos] = static_cast<int8_t>(word_len);
+        ++ascii_cache_cnt_;
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    ascii_cache_valid_ = true;
+  }
+  return ret;
+}
+
+OB_INLINE bool ObStopWordChecker::in_ascii_cache(const char *word, const int64_t word_len) const
+{
+  bool found = false;
+  int64_t left = 0;
+  int64_t right = ascii_cache_cnt_ - 1;
+  while (!found && left <= right) {
+    const int64_t mid = left + ((right - left) >> 1);
+    const int64_t cmp_len = ascii_cache_len_[mid];
+    int64_t cmp = 0;
+    if (word_len != cmp_len) {
+      cmp = (word_len < cmp_len) ? -1 : 1;
+    } else {
+      cmp = MEMCMP(word, ascii_cache_[mid], word_len);
+    }
+    if (0 == cmp) {
+      found = true;
+    } else if (cmp < 0) {
+      right = mid - 1;
+    } else {
+      left = mid + 1;
+    }
+  }
+  return found;
+}
+
+OB_INLINE bool ObStopWordChecker::try_check_ascii_stopword(
+    const ObFTWord &word,
+    bool &is_stopword) const
+{
+  bool decided = false;
+  if (OB_LIKELY(ascii_cache_valid_)) {
+    const ObString word_str = word.get_word().get_string();
+    const char *ptr = word_str.ptr();
+    const int64_t len = word_str.length();
+    // utf8mb4_general_ci ignores trailing spaces in both hashing and comparison, such
+    // words are left to the general path.
+    if (OB_LIKELY(len > 0 && ' ' != ptr[len - 1])) {
+      bool is_ascii = true;
+      char fold_buf[FTS_STOP_WORD_MAX_LENGTH];
+      if (len <= FTS_STOP_WORD_MAX_LENGTH) {
+        for (int64_t i = 0; is_ascii && i < len; ++i) {
+          const char c = ptr[i];
+          if (!ob_isascii(c)) {
+            is_ascii = false;
+          } else {
+            fold_buf[i] = (c >= 'A' && c <= 'Z') ? static_cast<char>(c + ('a' - 'A')) : c;
+          }
+        }
+      } else {
+        for (int64_t i = 0; is_ascii && i < len; ++i) {
+          if (!ob_isascii(ptr[i])) {
+            is_ascii = false;
+          }
+        }
+      }
+      // For an ascii word the general path is equivalent to a case insensitive byte
+      // comparison with the (ascii) stop word list: the charset conversion from any
+      // ascii compatible charset to utf8mb4 is the identity, and utf8mb4_general_ci
+      // compares ascii characters case insensitively.
+      if (is_ascii) {
+        decided = true;
+        is_stopword = (len <= FTS_STOP_WORD_MAX_LENGTH) ? in_ascii_cache(fold_buf, len) : false;
+      }
+    }
+  }
+  return decided;
+}
+
 void ObStopWordChecker::destroy()
 {
   if (inited_) {
     stopword_set_.destroy();
+    ascii_cache_cnt_ = 0;
+    ascii_cache_valid_ = false;
     inited_ = false;
   }
 }
@@ -76,12 +201,14 @@ int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
   int ret = OB_SUCCESS;
   
   
-  common::ObArenaAllocator allocator(lib::ObMemAttr("ChkStopWord"));
   if (OB_UNLIKELY(!inited_)) {
     ret = OB_NOT_INIT;
   } else if (OB_UNLIKELY(word.empty())) {
     ret = OB_INVALID_ARGUMENT;
+  } else if (OB_LIKELY(try_check_ascii_stopword(word, is_stopword))) {
+    // decided without a charset conversion nor a collation aware hash lookup
   } else {
+    common::ObArenaAllocator allocator(lib::ObMemAttr("ChkStopWord"));
     common::ObString cmp_str;
     // do nothing set out with in if type is the same.
     if (OB_FAIL(common::ObCharset::charset_convert(
