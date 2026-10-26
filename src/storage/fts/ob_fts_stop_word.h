@@ -132,6 +132,9 @@ public:
       K(word_map_.size()));
 
 private:
+  // Large enough for the tokens produced by the builtin parsers, so that the casedown
+  // check usually needs neither an allocation nor a copy.
+  static const int64_t CASE_DOWN_BUF_SIZE = 128L;
   bool is_min_max_word(const int64_t c_len) const;
   int casedown_word(const ObFTWord &src, ObFTWord &dst);
   int check_stopword(const ObFTWord &word, bool &is_stopword);
@@ -146,6 +149,7 @@ private:
   int64_t min_token_size_;
   int64_t max_token_size_;
   ObAddWordFlag flag_;
+  char case_down_buf_[CASE_DOWN_BUF_SIZE];
 };
 
 } // end namespace storage

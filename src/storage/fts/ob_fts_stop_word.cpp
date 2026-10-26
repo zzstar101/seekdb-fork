@@ -290,19 +290,50 @@ int ObAddWord::casedown_word(const ObFTWord &src, ObFTWord &dst)
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(src.empty())) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (flag_.casedown()) {
-    ObString dst_str;
-    if (OB_FAIL(ObCharset::tolower(
-                    word_meta_.get_collation_type(),
-                    src.get_word().get_string(),
-                    dst_str,
-                    allocator_))) {
-    } else {
-      ObFTWord tmp(dst_str.length(), dst_str.ptr(), word_meta_);
-      dst = tmp;
-    }
-  } else {
+  } else if (!flag_.casedown()) {
     dst = src;
+  } else {
+    const ObString src_str = src.get_word().get_string();
+    const ObCollationType coll_type = word_meta_.get_collation_type();
+    const ObCharsetInfo *cs_info = ObCharset::get_charset(coll_type);
+    if (OB_ISNULL(cs_info) || OB_ISNULL(cs_info->cset)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_UNLIKELY(1 != cs_info->casedn_multiply)) {
+      // a character may be expanded when being lower cased, nothing can be shared
+      ObString dst_str;
+      if (OB_FAIL(ObCharset::tolower(coll_type, src_str, dst_str, allocator_))) {
+      } else {
+        ObFTWord tmp(dst_str.length(), dst_str.ptr(), word_meta_);
+        dst = tmp;
+      }
+    } else {
+      const int64_t src_len = src_str.length();
+      char *lower_buf = case_down_buf_;
+      if (src_len > static_cast<int64_t>(sizeof(case_down_buf_))
+          && OB_ISNULL(lower_buf = static_cast<char *>(allocator_.alloc(src_len)))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else {
+        const size_t lower_len = cs_info->cset->casedn(
+            cs_info, const_cast<char *>(src_str.ptr()), src_len, lower_buf, src_len);
+        if (static_cast<int64_t>(lower_len) == src_len
+            && 0 == MEMCMP(lower_buf, src_str.ptr(), src_len)) {
+          // the word is already lower case, share the source string instead of copying it
+          dst = src;
+        } else if (lower_buf != case_down_buf_) {
+          ObFTWord tmp(static_cast<int64_t>(lower_len), lower_buf, word_meta_);
+          dst = tmp;
+        } else {
+          char *word_buf = static_cast<char *>(allocator_.alloc(lower_len));
+          if (OB_ISNULL(word_buf)) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+          } else {
+            MEMCPY(word_buf, lower_buf, lower_len);
+            ObFTWord tmp(static_cast<int64_t>(lower_len), word_buf, word_meta_);
+            dst = tmp;
+          }
+        }
+      }
+    }
   }
   return ret;
 }
