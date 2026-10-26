@@ -134,12 +134,15 @@ int ObIKFTParser::process_one_char(TokenizeContext &ctx,
                                    const ObFTCharUtil::CharType type)
 {
   int ret = OB_SUCCESS;
-  // proces by char with all segmenters
-  for (ObList<ObIIKProcessor *, ObIAllocator>::iterator iter = segmenters_.begin();
-       OB_SUCC(ret) && iter != segmenters_.end();
-       iter++) {
-    if (OB_FAIL((*iter)->process(ctx))) {
-    }
+  // Process by char with all segmenters, in fixed order. The current char data is
+  // passed down directly: fetching it again per segmenter is pure redundant work.
+  if (OB_UNLIKELY(OB_ISNULL(letter_seg_) || OB_ISNULL(quantifier_seg_)
+                  || OB_ISNULL(cjk_seg_) || OB_ISNULL(surrogate_seg_))) {
+    ret = OB_NOT_INIT;
+  } else if (OB_FAIL(letter_seg_->process(ctx, ch, char_len, type))) {
+  } else if (OB_FAIL(quantifier_seg_->process(ctx, ch, char_len, type))) {
+  } else if (OB_FAIL(cjk_seg_->process(ctx, ch, char_len, type))) {
+  } else if (OB_FAIL(surrogate_seg_->process(ctx, ch, char_len, type))) {
   }
   return ret;
 }
@@ -327,13 +330,13 @@ int ObIKFTParser::init_segmenter(const ObFTParserParam &param)
     ret = OB_ALLOCATE_MEMORY_FAILED;
   } else if (OB_ISNULL(surrogate_seg = OB_NEWx(ObIKSurrogateProcessor, &allocator_))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
-  } else if (OB_FAIL(segmenters_.push_back(letter_seg))) {
+  } else if (FALSE_IT(letter_seg_ = letter_seg)) {
   } else if (FALSE_IT(letter_seg = nullptr)) {
-  } else if (OB_FAIL(segmenters_.push_back(cnqsg))) {
+  } else if (FALSE_IT(quantifier_seg_ = cnqsg)) {
   } else if (FALSE_IT(cnqsg = nullptr)) {
-  } else if (OB_FAIL(segmenters_.push_back(cjksg))) {
+  } else if (FALSE_IT(cjk_seg_ = cjksg)) {
   } else if (FALSE_IT(cjksg = nullptr)) {
-  } else if (OB_FAIL(segmenters_.push_back(surrogate_seg))) {
+  } else if (OB_FALSE_IT(surrogate_seg_ = surrogate_seg)) {
   } else if (OB_FALSE_IT(surrogate_seg = nullptr)) {
   }
   // push back by order, quantifier is before cjk
@@ -354,13 +357,26 @@ void ObIKFTParser::reset()
     allocator_.free(ctx_);
   }
 
-  for (ObIIKProcessor *segmenter : segmenters_) {
-    if (!OB_ISNULL(segmenter)) {
-      segmenter->~ObIIKProcessor();
-      allocator_.free(segmenter);
-    }
+  if (!OB_ISNULL(letter_seg_)) {
+    letter_seg_->~ObIKLetterProcessor();
+    allocator_.free(letter_seg_);
+    letter_seg_ = nullptr;
   }
-  segmenters_.clear();
+  if (!OB_ISNULL(quantifier_seg_)) {
+    quantifier_seg_->~ObIKQuantifierProcessor();
+    allocator_.free(quantifier_seg_);
+    quantifier_seg_ = nullptr;
+  }
+  if (!OB_ISNULL(cjk_seg_)) {
+    cjk_seg_->~ObIKCJKProcessor();
+    allocator_.free(cjk_seg_);
+    cjk_seg_ = nullptr;
+  }
+  if (!OB_ISNULL(surrogate_seg_)) {
+    surrogate_seg_->~ObIKSurrogateProcessor();
+    allocator_.free(surrogate_seg_);
+    surrogate_seg_ = nullptr;
+  }
 
   cache_main_.reset();
   cache_quan_.reset();
