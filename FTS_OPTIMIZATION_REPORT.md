@@ -310,7 +310,16 @@ python3 tools/benchmark/fts_large_bench_score.py /tmp/report.txt
 1. **未达到 50%（官方 100/100）**。已实测三类相对提升：构建 0.16-0.24、分词 0.11、查询 0.20 ⇒ 综合 ≈0.17（≈34/100）。
    差距的最大两块是 `query_limit`（−2%，没有 block-max 辅助表，退化为"全量打分 + top-20 堆"）与分词的固定开销上限
    （官方 tokenize 语句里分词器只占约一半，其余是 SQL 解析/表达式框架/JSON 序列化）。
-2. **query_limit 无解的部分**：`LIMIT 20` 的语义是"按相关性排序后的前 20 条"，因此不能提前终止；该路径必须计算分数。要显著改善它需要 block-max/WAND 所需的辅助表在 DDL 阶段真正建出来（`need_block_max_scan()` 存在，但本次基准的隐藏辅助表中没有 block-max 表），属于跨 DDL/存储/执行的改动，未在本次完成。
+2. **query_limit 无解的部分**：`LIMIT 20` 的语义是"按相关性排序后的前 20 条"，因此不能提前终止；该路径必须计算分数。
+   要显著改善它需要 block-max/WAND 所需的辅助表在 DDL 阶段真正建出来（`need_block_max_scan()` 存在，但本次基准的隐藏辅助表中没有 block-max 表），属于跨 DDL/存储/执行的改动，未在本次完成。
+   **已实测并否定的替代方案**：曾把 `ObLogPlan::try_push_topn_into_text_retrieval_scan()`（`src/sql/optimizer/ob_log_plan.cpp:12742`）
+   临时短路成"不把 top-n 下推到全文扫描，让执行器物化全部候选再 top-N 排序"，计划确实变成 `TOP-N SORT ← TEXT RETRIEVAL SCAN`（命中数仍 20），
+   但 `query_limit` 的服务器 CPU 从 **2300 µs/语句涨到 19233 µs/语句（8.4 倍劣化）**。
+   原因是这条查询是 `is_index_back=true`：不下推时 9333 个候选要逐行走表达式框架求 BM25 分再排序/回表，而下推路径只为 20 行付出这些代价。
+   结论：top-n 下推必须保留，`query_limit` 只能从 WAND 主循环内部优化（`ObSRBMWIterImpl::top_k_search` 68% /
+   `evaluate_pivot` 46% / 每次 pivot 跳转重填 256 条 posting 25% / micro-block decode 14%），
+   而短批次重填必须连带收缩 eval frame、`ObDatumVector::mask_`、`skip_`（此前的粗暴版本因数组越界 abort 已回滚）。
+   该实验（含 19233 µs 这个反例）已回滚，未进入提交。
 3. **分词指标的固定开销**：官方 `tokenize_ik` 里 SQL 解析、表达式框架、JSON 序列化与结果集编码占大部分，分词器本身只占约一半；即使分词器再快一倍，指标也只有约 25-30% 的空间。本次分词器侧实测 ≈-10..-19%（tokenize_ik）。
 4. **构建并行度的不确定性**：dop 的最优值依赖机器负载（空载时 8 最好，有外部负载时 2-5 最好，8 会因 4 个辅助任务 × 8 worker 超订而退化）。最终取保守的 `cpu_count/2`，在两种情况下都不会灾难性退化，但也没有吃到空载时的全部收益。
 5. **构建的并行下限（已实现、实测、并主动回滚）**：PX 任务数由 `ObParallelRangeTaskPlanner::compute_total_task_count()`
