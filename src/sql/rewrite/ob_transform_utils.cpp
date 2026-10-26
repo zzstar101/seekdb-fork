@@ -12912,6 +12912,124 @@ static int check_match_pred_is_score_free(ObExecContext *exec_ctx,
   return ret;
 }
 
+// Whether every query ref of the statement is referenced exactly once, i.e. the projected
+// values of a sub query cannot be observed by another parent statement.
+static int check_subquery_not_shared(const ObDMLStmt *stmt, bool &not_shared)
+{
+  int ret = OB_SUCCESS;
+  not_shared = true;
+  if (OB_ISNULL(stmt)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), KP(stmt));
+  } else {
+    const ObIArray<ObQueryRefRawExpr *> &subquery_exprs = stmt->get_subquery_exprs();
+    for (int64_t i = 0; OB_SUCC(ret) && not_shared && i < subquery_exprs.count(); ++i) {
+      const ObQueryRefRawExpr *query_ref = subquery_exprs.at(i);
+      if (OB_ISNULL(query_ref)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("the query ref is null", K(ret), K(i));
+      } else if (query_ref->is_shared_reference()) {
+        not_shared = false;
+      }
+    }
+  }
+  return ret;
+}
+
+int ObTransformUtils::mark_count_only_output(ObDMLStmt *stmt, ObRawExprFactory &expr_factory)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(stmt) || !stmt->is_select_stmt()) {
+    // only select statements are handled here
+  } else {
+    ObSelectStmt *select_stmt = static_cast<ObSelectStmt *>(stmt);
+    const FromItem *from_item = NULL;
+    const TableItem *table_item = NULL;
+    if (select_stmt->is_count_only_output()
+        || select_stmt->is_set_stmt()
+        || select_stmt->has_distinct()
+        || 0 != select_stmt->get_group_expr_size()
+        || 0 != select_stmt->get_rollup_expr_size()
+        || select_stmt->has_having()
+        || select_stmt->has_order_by()
+        || select_stmt->has_limit()
+        || select_stmt->has_for_update()
+        || 0 != select_stmt->get_window_func_count()
+        || 0 != select_stmt->get_condition_exprs().count()
+        || 1 != select_stmt->get_select_item_size()
+        || 1 != select_stmt->get_from_item_size()
+        || 1 != select_stmt->get_table_size()) {
+      // not the shape of "select count(*) from (sub query) t"
+    } else if (OB_ISNULL(from_item = &select_stmt->get_from_item(0))
+               || from_item->is_joined_
+               || OB_ISNULL(table_item = select_stmt->get_table_item(*from_item))
+               || !table_item->is_generated_table()
+               || OB_ISNULL(table_item->ref_query_)) {
+      // the sub query is not the only table of the statement
+    } else {
+      ObSelectStmt *subquery = table_item->ref_query_;
+      ObRawExpr *count_expr = select_stmt->get_select_item(0).expr_;
+      bool shareable = false;
+      if (OB_ISNULL(count_expr)
+          || T_FUN_COUNT != count_expr->get_expr_type()
+          || 0 != static_cast<ObAggFunRawExpr *>(count_expr)->get_real_param_count()
+          || static_cast<ObAggFunRawExpr *>(count_expr)->is_param_distinct()) {
+        // only "count(*)" is handled here
+      } else if (!subquery->has_limit()
+                 || OB_ISNULL(subquery->get_limit_expr())
+                 || OB_NOT_NULL(subquery->get_offset_expr())
+                 || OB_NOT_NULL(subquery->get_limit_percent_expr())
+                 || subquery->is_fetch_with_ties()
+                 || subquery->is_set_stmt()
+                 || subquery->has_distinct()
+                 || subquery->has_for_update()
+                 || subquery->has_having()
+                 || 0 != subquery->get_aggr_item_size()
+                 || 0 != subquery->get_group_expr_size()
+                 || 0 != subquery->get_rollup_expr_size()
+                 || 0 != subquery->get_window_func_count()
+                 || subquery->is_count_only_output()) {
+        // the row count of the sub query depends on the ordering when the offset or the
+        // percentage or the with ties clause is used; the projected values are observable
+        // by the distinct, the having, the aggregation, the window functions and the
+        // locking read, so those sub queries are left untouched
+      } else if (OB_FAIL(check_subquery_not_shared(select_stmt, shareable))) {
+        LOG_WARN("failed to check whether the sub query is shared", K(ret));
+      } else if (!shareable) {
+        // the sub query is referenced by more than one parent, the projected values may be
+        // observable by the other parents
+      } else {
+        // The outer query only counts the rows, neither the ordering nor the projected values
+        // of the sub query are observable: keep the limit (the row count is still limited) but
+        // drop the ordering and project constants so that the scan does not need to look up
+        // the main table and the relevance score of the rows.
+        subquery->set_count_only_output(true);
+        if (subquery->get_order_item_size() > 0) {
+          subquery->get_order_items().reset();
+        }
+        ObIArray<SelectItem> &select_items = subquery->get_select_items();
+        for (int64_t i = 0; OB_SUCC(ret) && i < select_items.count(); ++i) {
+          SelectItem &item = select_items.at(i);
+          if (OB_ISNULL(item.expr_) || item.expr_->is_const_expr()) {
+            // do nothing
+          } else {
+            ObConstRawExpr *const_expr = NULL;
+            if (OB_FAIL(ObRawExprUtils::build_const_int_expr(expr_factory,
+                                                            ObIntType,
+                                                            0,
+                                                            const_expr))) {
+              LOG_WARN("failed to build the constant expression", K(ret));
+            } else {
+              item.expr_ = const_expr;
+            }
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ObTransformUtils::check_need_calc_match_score(ObExecContext *exec_ctx,
                                                   const ObDMLStmt *stmt,
                                                   ObRawExpr *match_expr,
@@ -12937,7 +13055,8 @@ int ObTransformUtils::check_need_calc_match_score(ObExecContext *exec_ctx,
     // only the natural language mode is handled here. The other modes (the boolean mode for
     // example) have extra matching rules, keep calculating the relevance score for them.
   } else if (OB_FALSE_IT(select_stmt = static_cast<ObSelectStmt*>(dml_stmt))) {
-  } else if (stmt->has_limit() || stmt->get_order_item_size() > 0
+  } else if ((stmt->has_limit() && !select_stmt->is_count_only_output())
+             || stmt->get_order_item_size() > 0
              || stmt->get_subquery_exprs().count() > 0) {
     // 1. the output of a full text retrieval scan is ordered by the relevance score, the
     //    score is required to keep the ordering of a limited query;

@@ -396,6 +396,13 @@ public:
   inline bool has_rollup() const { return get_rollup_expr_size() > 0; };
   inline bool has_order_by() const { return (get_order_item_size() > 0); }
   inline bool has_distinct() const { return is_distinct(); }
+  /*
+   * mark the sub query whose rows are only counted by the outer query. the row count of a
+   * limited query without offset is min(limit, row count), it does not depend on the row
+   * ordering, so the ordering and the projected values of such a sub query are not observable.
+   */
+  void set_count_only_output(bool count_only) { is_count_only_output_ = count_only; }
+  bool is_count_only_output() const { return is_count_only_output_; }
   inline bool has_having() const { return (get_having_expr_size() > 0); }
   inline bool has_rollup_dir() const { return (get_rollup_dir_size() > 0); }
   SetOperator get_set_op() const { return set_op_; }
@@ -551,6 +558,7 @@ private:
   bool is_recursive_cte_;
   /* These fields are only used by normal select */
   bool is_distinct_;
+  bool is_count_only_output_;
   // Used for the sort column specified in the search by clause of the cte recursive statement
   common::ObSEArray<SelectItem, 16, common::ModulePageAllocator, true> select_items_;
   common::ObSEArray<ObRawExpr*, 8, common::ModulePageAllocator, true> group_exprs_;

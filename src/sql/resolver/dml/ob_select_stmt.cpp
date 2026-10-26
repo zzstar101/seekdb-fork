@@ -199,6 +199,7 @@ int ObSelectStmt::assign(const ObSelectStmt &other)
     set_op_ = other.set_op_;
     is_recursive_cte_ = other.is_recursive_cte_;
     is_distinct_ = other.is_distinct_;
+    is_count_only_output_ = other.is_count_only_output_;
     is_view_stmt_ = other.is_view_stmt_;
     view_ref_id_ = other.view_ref_id_;
     is_match_topk_ = other.is_match_topk_;
@@ -242,6 +243,7 @@ int ObSelectStmt::deep_copy_stmt_struct(ObIAllocator &allocator,
     set_op_ = other.set_op_;
     is_recursive_cte_ = other.is_recursive_cte_;
     is_distinct_ = other.is_distinct_;
+    is_count_only_output_ = other.is_count_only_output_;
     is_view_stmt_ = other.is_view_stmt_;
     view_ref_id_ = other.view_ref_id_;
     is_match_topk_ = other.is_match_topk_;
@@ -367,6 +369,7 @@ ObSelectStmt::ObSelectStmt()
   limit_count_expr_  = NULL;
   limit_offset_expr_ = NULL;
   is_distinct_ = false;
+  is_count_only_output_ = false;
   is_set_distinct_ = false;
   set_op_ = NONE;
   is_recursive_cte_ = false;

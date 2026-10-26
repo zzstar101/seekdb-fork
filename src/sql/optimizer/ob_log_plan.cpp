@@ -12759,6 +12759,10 @@ int ObLogPlan::try_push_topn_into_text_retrieval_scan(ObLogicalOperator *&top,
   } else if (log_op_def::LOG_TABLE_SCAN != top->get_type()) {
     // do nothing
   } else if (OB_FALSE_IT(table_scan = static_cast<ObLogTableScan*>(top))) {
+  } else if (get_stmt()->is_select_stmt()
+             && static_cast<const ObSelectStmt*>(get_stmt())->is_count_only_output()) {
+    // the rows of the statement are only counted, the ordering of the rows is not observable,
+    // do not push the topn into the scan so that the relevance score is not required
   } else if (!table_scan->is_text_retrieval_scan() || table_scan->use_index_merge()) {
     // do nothing
   } else if (table_scan->get_filter_exprs().count() != 0 ||

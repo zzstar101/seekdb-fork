@@ -216,6 +216,10 @@ int ObTransformerImpl::do_transform(ObDMLStmt *&stmt)
   if (OB_ISNULL(stmt) || OB_ISNULL(query_ctx = stmt->get_query_ctx())
       || OB_ISNULL(ctx_) || OB_ISNULL(ctx_->session_info_)) {
     ret = OB_ERR_UNEXPECTED;
+  } else if (OB_ISNULL(ctx_->expr_factory_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(ObTransformUtils::mark_count_only_output(stmt, *ctx_->expr_factory_))) {
+    LOG_WARN("failed to mark the count only output sub query", K(ret));
   } else if (OB_FAIL(ctx_->session_info_->is_transformation_enabled(transformation_enabled))) {
   } else if (!transformation_enabled || query_ctx->get_global_hint().disable_query_transform()) {
     /*do nothing*/

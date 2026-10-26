@@ -2000,6 +2000,12 @@ private:
                             ObIArray<ObRawExpr*> &view_exprs);
 
 public:
+  /*
+   * mark the sub query whose rows are only counted by the outer query, see
+   * ObSelectStmt::set_count_only_output().
+   */
+  static int mark_count_only_output(ObDMLStmt *stmt, ObRawExprFactory &expr_factory);
+
   static int check_need_calc_match_score(ObExecContext *exec_ctx,
                                          const ObDMLStmt *stmt,
                                          ObRawExpr *match_expr,
