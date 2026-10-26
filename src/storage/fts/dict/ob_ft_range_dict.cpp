@@ -378,19 +378,32 @@ int ObFTRangeDict::match_with_hit(const ObString &single_word,
   return last_hit.dict_->match_with_hit(single_word, last_hit, hit);
 }
 
+namespace {
+// Range boundaries of a built-in dictionary are single characters and every caller
+// compares them against exactly one character, so CS_TYPE_UTF8MB4_BIN order is plain
+// byte order with a shorter-string-first tie break -- exactly what
+// ob_strnncoll_mb_bin (the utf8mb4_bin collation handler) computes:
+//   cmp = memcmp(min_len bytes); if (0 == cmp) cmp = slen - tlen;
+// Comparing the bytes directly skips the collation-handler indirection, the
+// argument validation and the charset lookup that ObCharset::strcmp pays per call.
+OB_INLINE int range_bound_cmp(const ObString &bound, const ObString &single_word)
+{
+  const int64_t len = MIN(bound.length(), single_word.length());
+  int cmp = (len > 0) ? MEMCMP(bound.ptr(), single_word.ptr(), len) : 0;
+  if (0 == cmp) {
+    cmp = static_cast<int>(bound.length() - single_word.length());
+  }
+  return cmp;
+}
+} // namespace
+
 int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict *&dict) const
 {
   int ret = OB_SUCCESS;
   bool found = false;
-  for (int i = 0; OB_SUCC(ret) && !found && i < range_dicts_.size(); ++i) {
-    if (ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                          range_dicts_[i].start_.get_word(),
-                          single_word)
-            <= 0
-        && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                             range_dicts_[i].end_.get_word(),
-                             single_word)
-               >= 0) {
+  for (int i = 0; !found && i < range_dicts_.size(); ++i) {
+    if (range_bound_cmp(range_dicts_[i].start_.get_word(), single_word) <= 0
+        && range_bound_cmp(range_dicts_[i].end_.get_word(), single_word) >= 0) {
       dict = range_dicts_[i].dict_;
       found = true;
     }
