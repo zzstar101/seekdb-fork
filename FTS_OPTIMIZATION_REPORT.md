@@ -199,6 +199,35 @@ planner 侧 `ObGranuleUtil`（`src/sql/engine/px/ob_granule_util.cpp:214-232`）
 
 ---
 
+### 4.6 count-only 子查询（去掉 LIMIT 查询的排序与打分）
+
+`query_limit` 这条基准 SQL 是
+`SELECT COUNT(*) FROM (SELECT id FROM docs WHERE MATCH(content) AGAINST('倒排索引 tokenizer') LIMIT 20) t`
+（`tools/benchmark/fts_large_bench.sh:327`，**没有 ORDER BY**）。计划里看到的 `sort_keys([MATCH DESC])`
+是优化器为「带 LIMIT 的全文扫描」自动合成的相关性排序（`ObLogPlan::try_push_topn_into_text_retrieval_scan`）。
+
+关键推理：无 OFFSET、无百分比 LIMIT、无 `WITH TIES` 时，`LIMIT n` 的行数恒为 `min(n, 子查询行数)`，
+与行序无关；外层只做 `COUNT(*)`，于是子查询的**排序和投影值都不可观测**。据此实现：
+
+| 步骤 | 位置 | 作用 |
+|---|---|---|
+| 识别 + 标记 | `ObTransformUtils::mark_count_only_output()`（`src/sql/rewrite/ob_transform_utils.cpp`），挂在 `ObTransformerImpl::do_transform()` | 只匹配：单 `COUNT(*)`、单生成表、无 join/where/group/rollup/having/order by/limit/window/for update 的外层；子查询带 LIMIT 且无 offset/percent/with ties/distinct/having/聚合/分组/window/for update/集合运算/共享 query ref |
+| 清排序 + 常量投影 | 同上（用 `ctx_->expr_factory_` + `ObRawExprUtils::build_const_int_expr`） | 子查询的 order items 清空、select 列表改成常量 ⇒ 扫描不再需要回表（`is_index_back=false`） |
+| 跳过 topn 下推 | `ObLogPlan::try_push_topn_into_text_retrieval_scan()` | 不再合成相关性排序，只保留 `limit(20)` |
+| 允许无相关性 | `ObTransformUtils::check_need_calc_match_score()` | count-only 且无 ORDER BY 时，即使有 LIMIT 也走免打分路径（省掉 df / avg doc len 估计、BM25、逐行过滤求值） |
+| 标志位 | `ObSelectStmt::is_count_only_output()`（`src/sql/resolver/dml/ob_select_stmt.{h,cpp}`） | 跨层传递决策 |
+
+效果：`EXPLAIN` 估算从 406225 µs 降到 949 µs，计划变成
+`SCALAR GROUP BY ← SUBPLAN SCAN t(20 rows) ← TEXT RETRIEVAL SCAN(access(nil), limit(20), is_index_back=false, calc_relevance=false)`。
+
+实测（本机，服务器 CPU/语句）：`query_limit` **3810 µs → 150 µs（−96%）**；官方 wall 口径
+`query_limit_avg_ms` **3.05 ms → 0.357 ms（−88%）**。另三条查询无 LIMIT，不受影响（实测 −0.5% 内）。
+
+正确性证据：四条基准命中数仍为 8001/11000/7332/20；`LIMIT 0/3/5/20/7000/100000`、双投影列、
+外层带谓词（必须不生效）、`SELECT *`（必须不生效）、`DISTINCT`/`GROUP BY`/聚合子查询（必须不生效）逐项正确；
+**40 组「生效 vs 不生效」差分（8 文本 × 5 个 LIMIT）全部一致**；`semcheck.sh` 1594 项 SEMANTIC OK；
+`mysem.sh` 34 项仅剩已知的同分并列差异。
+
 ## 5. 性能结果（实测）
 
 所有数字来自**冻结树**（HEAD `959947187`，二进制 `/tmp/ftsbench/bin/seekdb-final`，
@@ -264,9 +293,9 @@ build-dev 独立跑了同一对二进制（`bin/seekdb-base-5bce9e06` vs `bin/se
 - overall_improvement ≈ (0.20 + 0.113 + 0.203) / 3 ≈ **0.172**
 - 官方得分 ≈ 100 × 0.172 / 0.5 ≈ **34/100**（区间 32-36，取决于构建类取 −16% 还是 −24%）
 
-**结论（诚实版）**：本次优化拿到的是真实、可复现、语义等价的内核收益——查询 −20%（三条查询 −25% ~ −28%）、
-构建 −16% ~ −24%、分词 −11%（ik −15%）；`query_limit` 与 `tokenize_beng` 基本持平。**没有达到 100/100（≥50%）**，
-差距来源与下一步见第 8 节。
+**结论（5.4 是 count-only 落地之前的快照）**：当时拿到的是查询 −20%（三条查询 −25% ~ −28%）、构建 −16% ~ −24%、
+分词 −11%（ik −15%），`query_limit` 持平，折算约 34/100。之后 4.6 的 count-only 优化把 `query_limit` 从
+3.05 ms 降到 0.357 ms，折算得分提升到 **≈50/100**（见 5.6）；仍未达到 100/100（≥50%），差距与下一步见第 8 节。
 
 ### 5.5 独立复核链（`ab-final-confirm`，空载窗口 load 4-10，4 轮交替顺序）
 
@@ -288,6 +317,28 @@ build-dev 独立跑了同一对二进制（`bin/seekdb-base-5bce9e06` vs `bin/se
 
 这一链换算：tokenize 平均 **0.106**、query 平均 **0.195**、build 仍取 **0.20**（0.16-0.24 区间的保守值）
 ⇒ overall ≈ **0.167**，官方折算 ≈ **33/100**，与 5.4 的 0.172/34 一致（差异在噪声内）。
+
+### 5.6 count-only 优化落地后的最新数字（本轮新增）
+
+`query_limit` 一列被 4.6 改写后，其余八项不变。用官方脚本原样口径（`SKIP_LOAD=0` 全量）在
+`/tmp/ftsbench/bin/seekdb-co6`（build id `8402f2e6405b5eef`，HEAD `777ebc46d`）上跑出：
+
+```
+select1=0.0676 build_ik_all=5.3080 build_ik_content=4.4520 build_beng_en=2.0650
+tokenize_ik=0.1509 tokenize_beng=0.1000 query_cn=1.9403 query_beng=2.6555 query_mixed=1.8620 query_limit=0.3573
+```
+
+`query_limit` 由冻结树的 3.05-3.19 ms 降到 **0.357 ms**（wall，−88%），服务器 CPU 口径 −96%（150 µs）。
+
+更新后的类别平均与折算得分（其余类别沿用 5.2/5.3：
+
+| 类别 | 平均提升率 | 说明 |
+|---|---|---|
+| build | **0.20 ~ 0.226** | 5.3 三轮 wall，取保守 0.20 |
+| tokenize | **0.106 ~ 0.113** | 5.5 / 5.2 CPU 口径 |
+| query | **0.438** | (−25.6 −25.6 −27.9 −96.0)/4 |
+| overall | **≈0.248 ~ 0.259** | (build + tokenize + query)/3 |
+| 官方折算得分 | **≈50/100**（区间 47-52） | 100 × overall / 0.5 |
 
 ## 6. 正确性验证
 
@@ -328,19 +379,12 @@ python3 tools/benchmark/fts_large_bench_score.py /tmp/report.txt
 
 ## 8. 未完成 / 风险
 
-0. **最大的剩余杠杆（已设计、未实现）：`LIMIT` 子查询上的 `COUNT` 重写**。
-   官方 `query_limit` 语句是 `SELECT COUNT(*) FROM (SELECT id FROM docs WHERE MATCH(content) AGAINST('倒排索引 tokenizer') LIMIT 20) t`。
-   语义上，`LIMIT n`（无 `OFFSET`）子查询的行数恒等于 `min(n, 匹配行数)`，**与 `ORDER BY` 无关**，
-   因此这条语句对相关性分数是完全不可观测的；实测也印证了代价差异：无分数的同类计数语句（q_cn 形态）
-   服务器 CPU 约 1430-1533 µs，而带 top-n 下推的 `query_limit` 为 2300-2400 µs（本轮同机实测）/ 3789-3817 µs（团队 A/B 实测）。
-   若在重写阶段把 `COUNT(*) over (SELECT ... LIMIT n)` 改写成 `LEAST(COUNT(*), n)` 直接统计基表条件，
-   该语句就会落到已验证的"无分数"路径上，估算 `query_limit` 可降低 **40%-60%**（查询类目 +0.10-0.15，综合 +0.03-0.05，官方约 +7-10 分）。
-   需要新增一条重写规则，前置条件必须严格：外层只有一个 `COUNT(*)` 选择项、无 WHERE/GROUP/HAVING/ORDER/LIMIT/窗口/UNION/`for update`；
-   内层子查询无 DISTINCT / GROUP BY / HAVING / 窗口 / ROLLUP / CONNECT BY、`LIMIT n` 为正整数常量且无 `OFFSET`、非相关子查询、非 LATERAL；
-   满足时才可把内层的 from/where 合并到外层并套 `LEAST`。
-   未实现的原因：这属于新增优化规则，需要处理外连接、半连接、hidden column、part expr、hint 等一整套边界，
-   并需要单独的差分套件（`n > 匹配数`、`LIMIT 0`、带额外谓词、被 DISTINCT/GROUP BY 排除的形态各若干）证明改写前后结果集完全一致；
-   在本次剩余预算内无法完成充分验证，故按"未实现 + 设计留档"处理，而不是带着未验证的规则交付。
+0. **（本轮已完成，见 4.6 / 5.6）`LIMIT` 子查询上的 `COUNT` 重写**：早期设计是改写成 `LEAST(COUNT(*), n)`，
+   需要新增重写规则并合并 from/where；最终用更小、更安全的实现达成同样目的——只标记 count-only 子查询、
+   清掉它的排序、把投影列换成常量，于是扫描既不需要回表也不需要打分，而 `LIMIT` 保留在上层保证行数上限。
+   实测 `query_limit` 3.05 ms → 0.357 ms（wall −88%，CPU −96%），不需要构造 `LEAST` 表达式，也不改动任何 from/where。
+   剩余的边界风险（共享 query ref、DISTINCT/聚合/集合运算/for update/with ties/offset/percent/having 子查询、
+   外层有任何额外子句）已在 `mark_count_only_output()` 中逐项排除，并由 40 组差分 + semcheck 1594 项覆盖。
 
 1. **未达到 50%（官方 100/100）**。已实测三类相对提升：构建 0.16-0.24、分词 0.11、查询 0.20 ⇒ 综合 ≈0.17（≈34/100）。
    差距的最大两块是 `query_limit`（−2%，没有 block-max 辅助表，退化为"全量打分 + top-20 堆"）与分词的固定开销上限
@@ -393,7 +437,7 @@ python3 tools/benchmark/fts_large_bench_score.py /tmp/report.txt
 7. **回表限制**：`is_index_back=true` 的全文扫描必须保留相关性（回表路径只按"带相关性的 children 数组"实现）。这是本次调试中发现的既有约束，已用"回表则不加优化"的方式保守处理。
 8. **量化证据的边界**：单次运行的噪声极大（同一 binary 的 query_cn 在 1.55-3.10 ms 之间浮动，构建 1.6-8.1 s），所有结论都基于交错 A/B 的中位数与配对检验；构建类指标在负载 >25 时不可分辨，本报告对构建类的结论标注为"该负载下无法分辨"。
 
-9. **`query_limit` 的 count-only 优化（已实现、计划层生效、实测无收益、已回滚）**：`query_limit` 的 SQL 形如
+9. **`query_limit` 的 count-only 优化：第一版（只标 flag、不改投影）已回滚并被 4.6 的版本取代**：`query_limit` 的 SQL 形如
    `SELECT COUNT(*) FROM (SELECT id ... LIMIT 20) t`，而 `LIMIT n` 无 OFFSET/WITH TIES 时行数恒为
    `min(n, 匹配行数)`，与行序无关，因此外层的 `COUNT(*)` 让内层的"相关性排序 + 相关性分数"不可观测。据此实现：
    `ObSelectStmt::is_count_only_output()` 标记 + `ObTransformUtils::mark_count_only_output()`
