@@ -254,7 +254,6 @@ int ObFTDATReader<DATA_TYPE>::match_with_hit(const ObString &ft_char,
   int ret = OB_SUCCESS;
   ObFTWordCode code;
   hit.set_unmatch();
-  auto *map = dat_->get_map();
   int32_t *base = reinterpret_cast<int32_t *>(dat_->buff + dat_->base_offset_);
   int32_t *check = reinterpret_cast<int32_t *>(dat_->buff + dat_->check_offset_);
 
@@ -302,15 +301,23 @@ ObArrayHashMap *ObFTDAT::get_map() { return reinterpret_cast<ObArrayHashMap *>(b
 int ObArrayHashMap::find(const ObFTSingleWord &word, ObFTWordCode &code) const
 {
   int ret = OB_ENTRY_NOT_EXIST;
-  uint64_t hash = word.get_word().hash();
-  uint64_t index = hash % header_.capacity_;
-  while (header_.data[index].used) {
-    if (header_.data[index].word == word) {
-      code = header_.data[index].code;
+  const uint64_t capacity = header_.capacity_;
+  const Entry *data = header_.data;
+  const uint64_t hash = word.get_word().hash();
+  // capacity >= MIN_CAPACITY > 3, so stepping by 3 and subtracting capacity once
+  // is exactly the same probe sequence as (index + 3) % capacity, without the
+  // integer division per step.
+  uint64_t index = hash % capacity;
+  while (data[index].used) {
+    if (data[index].word == word) {
+      code = data[index].code;
       ret = OB_SUCCESS;
       break;
     } else {
-      index = (index + 3) % header_.capacity_;
+      index += 3;
+      if (index >= capacity) {
+        index -= capacity;
+      }
     }
   }
   return ret;
