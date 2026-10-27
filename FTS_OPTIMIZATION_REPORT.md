@@ -576,6 +576,7 @@ python3 tools/benchmark/fts_large_bench_score.py /tmp/report.txt
 | 去掉 text-retrieval 的 top-n 下推（`try_push_topn_into_text_retrieval_scan` 提前返回） | 让 LIMIT 不被下推到扫描 | `query_limit` **2300 → 19233 µs（8.4× 更差）**：该查询 `is_index_back=true`，下推时只为 20 行付打分代价，不下推要为 9333 个候选付 | 回滚。top-n 下推必须保留 |
 | `query_limit` 短批量回填（advance 后只回填 16 行） | 每次 pivot 跳转只消费一个 posting，减少解码 | **+60% 更差**（3766 vs 2400 µs）：每次回填都要付一次 `das_scan_advance` 重定位，256 行批量摊薄了 seek | 回滚。q_limit 的成本是 pivot seek 次数本身，只能靠 block-max 统计消除 |
 | 跳过 `ObMacroBlockWriter::check_order()`（默认开启的 `need_check_order_` 闸门，仅 DDL 辅助表关闭） | 逐行校验 rowkey 序，中段占单 worker self-CPU 11.0% | 语义干净（semcheck 1594 OK、索引布局/df/postings/docword 一致），闸门生效可证（check_order 188 样本→0，write 桶 26.4%→5.9%），但上限 ≈构建 wall 4-5% ⇒ ≤1.5 分，每 ALTER wall 的配对 A/B 未越噪声 | 回滚（inside noise）。三项数字均为 mid-ALTER self-CPU 份额，不等于 build wall |
+| 把辅助表词列换成二进制排序规则（`utf8mb4_bin`）或等价的 ASCII memcmp 快路径 | 辅助表词列是 `utf8mb4_general_ci`（继承被分词列的 collation，`src/sql/resolver/ddl/ob_fts_index_builder_util.cpp:1197-1198`），比较走 `ObCharset::strcmpsp` → `ob_strnncollsp_utf8mb4` + `ob_mb_wc_utf8mb4`；mid-ALTER self-CPU 中 `ob_strnncollsp_utf8mb4` 11.3 % + `ob_mb_wc_utf8mb4` 7.1 % + `ObCharset::is_argument_valid` 4.2 % + `ObCharset::strcmpsp` 3.0 % ≈ 25 % | 语义侧 `utf8mb4_bin` **不可用**：general_ci 是**权重相等**而非字节相等（服务端实测 `'e' = 'é'` → 1、`'i' = 'İ'` → 1），分词器只做大小写折叠（`ObAddWord::casedown_word`）不做重音折叠 ⇒ 换 bin 会改变非 ASCII 的 MATCH 语义。成本侧实测：同形状 700k 行纯 ASCII 排序+插入（`w varchar(16384)` + `d varbinary(16)`，`order by 1,2`，即辅助表 rowkey 形状），general_ci **14.756 / 14.752 s**（CPU 15.05 / 14.09 s）vs `utf8mb4_bin` **16.511 / 14.457 s**（CPU 15.27 / 14.39 s） | 不实施（实测天花板 ≈0）。即使把每次比较都换成 memcmp（ASCII 快路径的最好情况）也不减少这条路径的墙钟——构建在 dop=5 下是**延迟受限**（§10.3），省下的比较 CPU 填不满等待期。词列 general_ci 保留，作为构建类别的算法层答案记录在 §10.4 |
 | 串行化同一 ALTER 的两张重辅助表构建（实验用差量：`FTS_AUX_GAP_MS` 把 doc-word 辅助任务推迟提交，未进入分支） | 两张重表并发提交，抢同一批 PX/DDL worker，怀疑互相拖慢 | gap=0（并发）：ALTER#2 wall **3.742 s**，索引表 2.924 s + 词表 3.584 s 同一时刻起跑；ALTER#3 wall **2.346 s**（1.988 + 2.131 s）。gap=30 s（各自独跑）：索引表 **4.138 s**、词表 **4.672 s**（起跑正好晚 30.0 s），ALTER#3 为 1.653 + 3.231 s ⇒ 串行总量 8.81 s（#2）/ 4.88 s（#3） | 回滚。**并发已是最优**：独跑的单表墙钟并不比并发时更快，串行化会把 ALTER wall 抬高 ~2.1-2.4×；每张表的瓶颈是延迟（单线程尾部 + latch/IO 等待），交错执行正好填满等待期 |
 
 **方法论教训**（已写入 §2）：本轮两次假阳性都来自负载混淆——一次是「granule −19%」（load 18 vs load 6 的两段数据），一次是同二进制 5 次 full run 的 1.9-2.7× 抖动。规则因此改为：只认交替臂序的配对链 + 服务器 CPU 计数（CV 3-9%）作主指标，wall 仅作确认，且任何结论必须写出 IQR 与噪声底线。
@@ -716,3 +717,40 @@ PX COORDINATOR                                         (dop=5)
 (b) 更便宜的归并 / 按分片直写 = **唯一还有量级的地方，但由 PDML 计划形状（MATERIAL + dop=1 单流 + QC 归并）决定，
 属 `src/sql/optimizer/**`（Lead 范围）**，DDL 侧能做的最多是换内层 SQL 的形状（先按 key 分片路由、再各分片自排自写），需要优化器配合；
 (c) 并行 sorter = 在 (b) 之前不值得，收益上限被 §10 的 ≤5% 结论压住。
+
+### 10.4 排序规则（collation）不是构建瓶颈：实测天花板 ≈0（build-dev，2026-10-27 08:10）
+
+背景：辅助表的词列是 `utf8mb4_general_ci`（`__word_segment_*` 的 collation 由被分词列继承，
+`src/sql/resolver/ddl/ob_fts_index_builder_util.cpp:1197-1198`；doc-id 列是 `CS_TYPE_BINARY`，同文件 `:1012-1013`），
+而 `oceanbase.__all_column` 实测：`__word_segment_*` collation_type **45 = utf8mb4_general_ci**，
+`__doc_id_*` collation_type **63 = CS_TYPE_BINARY**。因此每次 rowkey/排序键比较都要走
+`ObNullSafeDatumStrCmp<(ObCollationType)45, false, true>::cmp`（`src/share/datum/ob_datum_funcs_impl.h:162`）
+→ `ObCharset::strcmpsp`（`src/share/common/ob_charset.cpp`）→ `ob_strnncollsp_utf8mb4` + `ob_mb_wc_utf8mb4`。
+
+**先划清位置**：被怀疑的 `ObScanMergeLoserTreeCmp::compare_rowkey`（`src/storage/access/ob_scan_merge_loser_tree.cpp:50`）
+在 3.35 MB 的构建采样里只出现 8 行，调用栈是**读侧**多源合并
+（`ObTableScanOp::get_next_batch_with_das` → `ObDASMergeIter` → `ObDASScanIter` → `ObMultipleScanMerge::supply_consume` → `ObMergeLoserTree`），
+不是辅助表写入路径；构建里真正的比较量在 SQL sorter / QC merge sort（`ObSortOpImpl::Compare`，ALTER#2 窗口 inclusive ≈35 %）。
+
+**两条路都实测否掉：**
+1. 换 `utf8mb4_bin`（表单层捷径）——**语义不可接受**：general_ci 相等是**权重相等**，
+   服务端实测 `'e' = 'é'` → 1、`'i' = 'İ'` → 1，而分词器只做大小写折叠、不做重音折叠，
+   所以今天「存 `é`、查 `e`」能命中，换成 bin 之后就不再命中 ⇒ 是用户可见的 MATCH 语义变化，不是行序变化。
+   检索侧也确认：`ObTextRetrievalTokenIter::update_scan_param`（`src/storage/retrieval/ob_text_retrieval_token_iter.cpp:304-321`）
+   直接用**原始 token 字节**构造 scan range 并继承 meta collation，所以 bin 不会破坏 range 构造，但会破坏上面的等值语义。
+2. ASCII memcmp 快路径（比较器层捷径，语义等价）——**技术上可容纳**（判 ASCII 全字节 < 0x80 后折叠大小写再 memcmp，
+   否则回落到原 `ObDatumCmpFuncType`），但**天花板实测为 0**：用与辅助表同形状的 700k 行纯 ASCII 数据
+   （`w varchar(16384)` + `d varbinary(16)`，`insert ... order by 1,2`，`parallel(5) use_px`，
+   heap 表 `fts_coll2.s_gci` / `s_bin`，交替 2 轮，load 7-19）：
+
+| 轮次 | `utf8mb4_general_ci` | `utf8mb4_bin`（= 每次比较都是 memcmp 的最好情况） |
+|---|---|---|
+| r1 | wall **14.756 s** / CPU 15.05 s | wall 16.511 s / CPU 15.27 s |
+| r2 | wall **14.752 s** / CPU 14.09 s | wall 14.457 s / CPU 14.39 s |
+
+   两臂在噪声内相同（CPU 也是），即把比较从 general_ci 权重比较降到字节比较**不改变这条流水线的墙钟**。
+   原因与 §10.3 一致：dop=5 下的构建是延迟受限（尾部单线程写 + latch/IO 等待），比较 CPU 省下来也只是让 worker 更早进入等待。
+
+**结论（构建类别的算法层答案）：** 词列 collation 与比较器快路径都不是可回收的构建 wall；
+`sorter/merge 比较 → 编码写入` 这条链的上限由 §10 的 ≤5 % 压住，真正的量级仍在 PDML 计划形状（§10.3 的 (b)，属优化器范围）。
+复现脚本：`/tmp/ftsbench/bd_coll2.sh <port> <label> <rounds>`，原始行 `/tmp/ftsbench/reports/bd-coll2.txt`。
