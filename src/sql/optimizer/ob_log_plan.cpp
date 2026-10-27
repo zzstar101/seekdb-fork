@@ -11987,6 +11987,42 @@ int ObLogPlan::construct_startup_filter_for_limit(ObRawExpr *limit_expr, ObLogic
   return ret;
 }
 
+// A full text retrieval scan feeds nothing but the number of matching documents when the
+// statement that owns it observes only that number: a bare `COUNT(*)` over the match predicate,
+// or a sub query whose select items were already reduced to constants by
+// mark_count_only_output() so that only its row count is observable. In both cases the retrieval
+// layer may count the merged documents instead of materializing and projecting them.
+// This test is strictly narrower than the score free decision: it additionally requires that the
+// statement projects nothing but the row count, so a statement that returns the document ids (or
+// any other column) can never reach it.
+static bool need_count_only_text_scan(const ObDMLStmt *stmt, const ObMatchFunRawExpr &match_expr)
+{
+  bool need_count_only = false;
+  if (nullptr != stmt && stmt->is_select_stmt() && 0 == stmt->get_subquery_exprs().count()) {
+    const ObSelectStmt *select_stmt = static_cast<const ObSelectStmt *>(stmt);
+    if (!select_stmt->has_for_update()) {
+      if (select_stmt->is_count_only_output()) {
+        // only the number of rows of this sub query is observed by the outer query
+        need_count_only = true;
+      } else if (!select_stmt->has_limit()
+          && !select_stmt->is_distinct()
+          && !select_stmt->has_group_by()
+          && !select_stmt->has_having()
+          && !select_stmt->has_order_by()
+          && 0 == select_stmt->get_window_func_count()
+          && 1 == select_stmt->get_select_item_size()
+          && ObMatchAgainstMode::NATURAL_LANGUAGE_MODE == match_expr.get_mode_flag()) {
+        const ObRawExpr *select_expr = select_stmt->get_select_item(0).expr_;
+        if (nullptr != select_expr && T_FUN_COUNT == select_expr->get_expr_type()) {
+          const ObAggFunRawExpr *count_expr = static_cast<const ObAggFunRawExpr *>(select_expr);
+          need_count_only = 0 == count_expr->get_real_param_count() && !count_expr->is_param_distinct();
+        }
+      }
+    }
+  }
+  return need_count_only;
+}
+
 int ObLogPlan::prepare_text_retrieval_scan(const ObIArray<ObRawExpr *> &scan_match_exprs,
                                            const ObIArray<ObRawExpr *> &scan_match_filters,
                                            const ObIArray<ObRawExpr *> &all_match_filters,
@@ -12059,6 +12095,8 @@ int ObLogPlan::prepare_text_retrieval_scan(const ObIArray<ObRawExpr *> &scan_mat
       // retrieval scan satisfies it, so the filter is removed from the plan.
       tr_info.need_calc_relevance_ = false;
       tr_info.pushdown_match_filter_ = NULL;
+      // nothing above the scan observes its output rows, so it only has to count them
+      tr_info.count_only_scan_ = need_count_only_text_scan(get_stmt(), *match_against);
       if (OB_FAIL(append_array_no_dup(get_optimizer_context().get_query_ctx()->all_expr_constraints_,
                                       constraints))) {
         LOG_WARN("failed to append expr constraints", K(ret));

@@ -104,6 +104,12 @@ protected:
   virtual int filter_on_demand(const int64_t count, const double relevance, bool &need_project);
   virtual int cache_result(int64_t &count, const ObDatum &id_datum, const double relevance);
   virtual int project_results(const int64_t count);
+  // Counting-only merge: the merged rows are not consumed, only their number is. The merge loop
+  // then counts the matching documents instead of materializing them into the output buffer, so
+  // neither the document id copy nor the projection of the output row is done.
+  int get_next_rows_count_only(const int64_t capacity, int64_t &count);
+  virtual int do_one_count_round(int64_t &count);
+  int count_result(int64_t &count);
   // Merge the dimension iterators with a direct comparison of their current document ids
   // instead of the generic merge heap. It can only be used when the per-dimension relevance is
   // not consumed by the query, so the merge only has to produce every distinct document id in
@@ -114,6 +120,8 @@ protected:
   // computed: a constant positive value keeps the "the document appears in this dimension"
   // semantic of the relevance collector while avoiding the score evaluation.
   inline bool need_score() const { return need_score_; }
+  // Whether only the number of merged rows is consumed by the query.
+  inline bool count_only() const { return count_only_; }
 protected:
   ObIAllocator *iter_allocator_;
   ObSparseRetrievalMergeParam *iter_param_;
@@ -128,6 +136,7 @@ protected:
   int64_t next_round_cnt_;
   void (*set_datum_func_)(ObDatum &, const ObDocIdExt &);
   bool need_score_;
+  bool count_only_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObSRDaaTIterImpl);
 };

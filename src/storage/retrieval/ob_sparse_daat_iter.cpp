@@ -92,7 +92,8 @@ ObSRDaaTIterImpl::ObSRDaaTIterImpl()
     next_round_iter_idxes_(),
     next_round_cnt_(0),
     set_datum_func_(nullptr),
-    need_score_(true)
+    need_score_(true),
+    count_only_(false)
 {
 }
 
@@ -120,6 +121,11 @@ int ObSRDaaTIterImpl::init(
         || iter_param_->need_project_relevance()
         || iter_param_->need_filter()
         || iter_param_->need_pushdown_topk();
+    // The merged rows are only observable through the projected document id, which is decided
+    // above the retrieval layer: the scan counts its rows instead of producing them only when the
+    // plan said so (a bare COUNT over the match predicate). It is never inferred from "the
+    // relevance is not projected" alone.
+    count_only_ = iter_param_->need_count_only();
     const int64_t max_batch_size = OB_MAX(iter_param_->eval_ctx_->max_batch_size_, iter_param_->max_batch_size_);
     if (iter_param_->id_proj_expr_->datum_meta_.type_ == common::ObUInt64Type) {
       set_datum_func_ = ObISparseRetrievalMergeIter::set_datum_int;
@@ -269,6 +275,8 @@ int ObSRDaaTIterImpl::get_next_rows(const int64_t capacity, int64_t &count)
     ret = OB_NOT_INIT;
   } else if (OB_UNLIKELY(0 == capacity)) {
     count = 0;
+  } else if (count_only()) {
+    ret = get_next_rows_count_only(capacity, count);
   } else if (0 == dim_iters_->count()) {
     ret = OB_ITER_END;
   } else if (iter_param_->limit_param_->is_valid() && output_row_cnt_ >= iter_param_->limit_param_->limit_) {
@@ -293,6 +301,64 @@ int ObSRDaaTIterImpl::get_next_rows(const int64_t capacity, int64_t &count)
       }
     }
 
+  }
+  return ret;
+}
+
+int ObSRDaaTIterImpl::get_next_rows_count_only(const int64_t capacity, int64_t &count)
+{
+  int ret = OB_SUCCESS;
+  if (0 == dim_iters_->count()) {
+    ret = OB_ITER_END;
+  } else if (iter_param_->limit_param_->is_valid() && output_row_cnt_ >= iter_param_->limit_param_->limit_) {
+    ret = OB_ITER_END;
+  } else if (OB_FAIL(pre_process())) {
+    if (OB_UNLIKELY(OB_ITER_END != ret)) {
+    } else {
+      count = 0;
+    }
+  } else {
+    count = 0;
+    const int64_t real_capacity = MIN(capacity, iter_param_->max_batch_size_);
+    while (OB_SUCC(ret) && count < real_capacity) {
+      if (OB_FAIL(do_one_count_round(count))) {
+        if (OB_UNLIKELY(OB_ITER_END != ret)) {
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObSRDaaTIterImpl::do_one_count_round(int64_t &count)
+{
+  int ret = OB_SUCCESS;
+  bool need_project = true;
+  bool got_valid_id = false;
+  double relevance = 0.0;
+  const ObDatum *id_datum = nullptr;
+  if (OB_FAIL(fill_merge_heap())) {
+    if (OB_UNLIKELY(OB_ITER_END != ret)) {
+    }
+  } else if (OB_FAIL(collect_dims_by_id(id_datum, relevance, need_project))) {
+  } else if (need_project && OB_FAIL(count_result(count))) {
+  }
+  return ret;
+}
+
+int ObSRDaaTIterImpl::count_result(int64_t &count)
+{
+  int ret = OB_SUCCESS;
+  const common::ObLimitParam *limit_param = iter_param_->limit_param_;
+  ++input_row_cnt_;
+  if (limit_param->is_valid() && input_row_cnt_ <= limit_param->offset_) {
+    // the row is only skipped, it is not part of the counted rows
+  } else {
+    ++count;
+    ++output_row_cnt_;
+    if (limit_param->is_valid() && output_row_cnt_ >= limit_param->limit_) {
+      ret = OB_ITER_END;
+    }
   }
   return ret;
 }

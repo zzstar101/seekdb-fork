@@ -383,6 +383,9 @@ int ObDASLegacyTRMergeIter::create_sparse_retrieval_iter()
   sr_iter_param_.relevance_proj_expr_ = ir_ctdef_->relevance_proj_col_;
   sr_iter_param_.filter_expr_ = ir_ctdef_->match_filter_;
   sr_iter_param_.topk_limit_ = topk_limit_;
+  // the plan decided that nothing above this scan observes its output rows, so the merge only
+  // has to count the matching documents instead of materializing and projecting them
+  sr_iter_param_.count_only_ = ir_ctdef_->need_count_only_scan();
   if (OB_NOT_NULL(ir_ctdef_->field_boost_expr_)) {
     ObDatum *boost_datum = nullptr;
     if (OB_FAIL(ir_ctdef_->field_boost_expr_->eval(*ir_rtdef_->eval_ctx_, boost_datum))) {

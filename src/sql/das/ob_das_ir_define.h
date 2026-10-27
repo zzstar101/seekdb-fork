@@ -85,6 +85,10 @@ public:
       flags_(0),
       field_boost_expr_(nullptr) {}
   bool need_calc_relevance() const { return nullptr != relevance_expr_; }
+  // Set when nothing above this scan consumes its output rows, i.e. only the number of matching
+  // documents is observed (a bare COUNT over the match predicate). The retrieval layer may then
+  // count the merged documents instead of materializing and projecting them.
+  bool need_count_only_scan() const { return count_only_scan_; }
   bool need_proj_relevance_score() const { return nullptr != relevance_proj_col_; }
   bool need_inv_idx_agg() const { return has_inv_agg_ && need_calc_relevance(); }
   bool need_block_max_scan() const { return has_block_max_scan_; }
@@ -188,7 +192,7 @@ public:
     {
       uint8_t has_inv_agg_:1;
       uint8_t has_doc_id_agg_:1;
-      uint8_t reserved_ir_scan_flag_:1;
+      uint8_t count_only_scan_:1;
       uint8_t has_block_max_scan_:1;
       uint8_t has_avg_doc_len_est_:1;
       uint8_t reserved_:3;
