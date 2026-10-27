@@ -754,3 +754,10 @@ PX COORDINATOR                                         (dop=5)
 **结论（构建类别的算法层答案）：** 词列 collation 与比较器快路径都不是可回收的构建 wall；
 `sorter/merge 比较 → 编码写入` 这条链的上限由 §10 的 ≤5 % 压住，真正的量级仍在 PDML 计划形状（§10.3 的 (b)，属优化器范围）。
 复现脚本：`/tmp/ftsbench/bd_coll2.sh <port> <label> <rounds>`，原始行 `/tmp/ftsbench/reports/bd-coll2.txt`。
+
+## 11 独立环境复核：官方评分在本任务开始前即已饱和
+第二台独立机器（Ubuntu, 2 vCPU, 11 GiB, 独占无外载），安装**官方发布包**（未含本分支任何改动）`OceanBase seekdb 1.4.0.0, revision 1-0003f8d4b`，用仓库原始脚本按正式参数跑一次（`ROWS=20000 BATCH=500 ROUNDS=3000 QUERY_ROUNDS=200 SAMPLES=3 WARMUP=30 SKIP_LOAD=0`），官方 `fts_large_bench_score.py` 输出：
+
+`score: 100.00 / 100 (`mean_improvement 68.62%`)`；build 60.75%（13.483 / 11.292 / 5.865 s），tokenize 62.92%（0.2727 / 0.1627 ms），query 82.18%（2.6512 / 3.9051 / 2.9017 / 3.6956 ms），四项命中数与基线一致。
+
+结论（可复核）：`fts_large_bench_baseline.json` 中的 CI 基线比一台 2 核虚拟机还慢 2.6-6.3 倍，因此**未修改的代码在任何现代机器上都已经拿到 100/100**，官方分数已饱和、不能作为优化程度的判别量。本报告因此始终以「同机同二进制交替配对 delta」为唯一判据（§2），官方分数只作为投影列出。
