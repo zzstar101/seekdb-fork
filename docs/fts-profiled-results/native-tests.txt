@@ -1,0 +1,39 @@
+Running main() from gtest_main.cc
+[==========] Running 12 tests from 3 test cases.
+[----------] Global test environment set-up.
+[----------] 5 tests from WordAggregationTest
+[ RUN      ] WordAggregationTest.new_and_repeated_words_keep_frequency_contract
+[       OK ] WordAggregationTest.new_and_repeated_words_keep_frequency_contract (0 ms)
+[ RUN      ] WordAggregationTest.collation_equal_tokens_keep_first_spelling
+[       OK ] WordAggregationTest.collation_equal_tokens_keep_first_spelling (0 ms)
+[ RUN      ] WordAggregationTest.colliding_new_words_and_updates_keep_all_entries
+[       OK ] WordAggregationTest.colliding_new_words_and_updates_keep_all_entries (1 ms)
+[ RUN      ] WordAggregationTest.errors_do_not_add_words_or_document_length
+[       OK ] WordAggregationTest.errors_do_not_add_words_or_document_length (0 ms)
+[ RUN      ] WordAggregationTest.helper_reuse_clears_only_previous_document
+[       OK ] WordAggregationTest.helper_reuse_clears_only_previous_document (0 ms)
+[----------] 5 tests from WordAggregationTest (1 ms total)
+
+[----------] 4 tests from CharClassificationTest
+[ RUN      ] CharClassificationTest.every_valid_utf8_scalar_matches_legacy
+[       OK ] CharClassificationTest.every_valid_utf8_scalar_matches_legacy (37 ms)
+[ RUN      ] CharClassificationTest.utf8_invalid_and_truncated_inputs_keep_errors_and_type
+[       OK ] CharClassificationTest.utf8_invalid_and_truncated_inputs_keep_errors_and_type (0 ms)
+[ RUN      ] CharClassificationTest.every_utf16_code_unit_keeps_existing_behavior
+[       OK ] CharClassificationTest.every_utf16_code_unit_keeps_existing_behavior (4 ms)
+[ RUN      ] CharClassificationTest.utf16_surrogate_pairs_and_prefixes_keep_existing_behavior
+[       OK ] CharClassificationTest.utf16_surrogate_pairs_and_prefixes_keep_existing_behavior (0 ms)
+[----------] 4 tests from CharClassificationTest (41 ms total)
+
+[----------] 3 tests from CharsetStrcmpspDispatch
+[ RUN      ] CharsetStrcmpspDispatch.initialized_and_first_use_keep_handler_results
+[       OK ] CharsetStrcmpspDispatch.initialized_and_first_use_keep_handler_results (3 ms)
+[ RUN      ] CharsetStrcmpspDispatch.null_pointer_with_zero_length_remains_empty
+[       OK ] CharsetStrcmpspDispatch.null_pointer_with_zero_length_remains_empty (0 ms)
+[ RUN      ] CharsetStrcmpspDispatch.invalid_arguments_keep_the_existing_zero_result
+[       OK ] CharsetStrcmpspDispatch.invalid_arguments_keep_the_existing_zero_result (0 ms)
+[----------] 3 tests from CharsetStrcmpspDispatch (3 ms total)
+
+[----------] Global test environment tear-down
+[==========] 12 tests from 3 test cases ran. (45 ms total)
+[  PASSED  ] 12 tests.

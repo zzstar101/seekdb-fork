@@ -1,0 +1,141 @@
+built_index_boundaries
+hits
+255
+hits
+256
+hits
+257
+hits
+512
+hits
+513
+hits
+257
+hits
+256
+hits
+255
+hits
+256
+hits
+513
+hits
+513
+hits
+384
+hits
+0
+hits
+0
+insert_after_index_boundaries
+hits
+255
+hits
+256
+hits
+257
+hits
+512
+hits
+513
+hits
+513
+hits
+384
+scored_membership_oracle
+term	hits	first_id	last_id	positive_scores
+alpha	255	1	255	255
+bravo	256	1	256	256
+charlie	257	1	257	257
+delta	512	1	512	512
+echo	513	1	513	513
+union_matches_oracle
+1
+count_matches_oracle
+1
+limits_at_batch_boundaries
+hits
+0
+hits
+1
+hits
+256
+hits
+257
+hits
+512
+hits
+513
+hits
+513
+hits
+255
+hits
+512
+hits
+0
+hits
+1
+hits
+256
+hits
+257
+prepared_batch_reuse
+hits
+512
+hits
+513
+hits
+255
+hits
+255
+hits
+0
+hits
+0
+hits
+513
+committed_versions_and_delete
+hits
+257
+hits
+256
+hits
+256
+hits
+511
+hits
+512
+hits
+512
+term	hits	id_sum	positive_scores
+alpha	257	33667	257
+echo	512	131842	512
+count_matches_oracle
+1
+read_own_writes
+hits
+258
+hits
+257
+hits
+512
+hits
+513
+hits	positive_scores
+513	513
+count_matches_oracle
+1
+rollback_restores_boundary
+hits
+257
+hits
+256
+hits
+511
+hits
+512
+hits	id_sum	positive_scores
+512	131842	512
+count_matches_oracle
+1

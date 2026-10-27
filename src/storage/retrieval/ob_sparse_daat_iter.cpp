@@ -436,7 +436,7 @@ int ObSRDaaTIterImpl::collect_dims_by_id(const ObDatum *&id_datum, double &relev
   relevance = 0.0;
   got_valid_id = false;
 
-  while (OB_SUCC(ret) && !merge_heap_->empty() && !curr_doc_end) {
+  while (OB_SUCC(ret) && !curr_doc_end && !merge_heap_->empty()) {
     if (merge_heap_->is_unique_champion()) {
       curr_doc_end = true;
     }

@@ -11995,23 +11995,47 @@ int ObLogPlan::construct_startup_filter_for_limit(ObRawExpr *limit_expr, ObLogic
 // This test is strictly narrower than the score free decision: it additionally requires that the
 // statement projects nothing but the row count, so a statement that returns the document ids (or
 // any other column) can never reach it.
-static bool need_count_only_text_scan(const ObDMLStmt *stmt, const ObMatchFunRawExpr &match_expr)
+static bool need_count_only_text_scan(const ObDMLStmt *stmt,
+                                      const ObMatchFunRawExpr &match_expr,
+                                      const ObRawExpr *match_pred)
 {
   bool need_count_only = false;
-  if (nullptr != stmt && stmt->is_select_stmt() && 0 == stmt->get_subquery_exprs().count()) {
+  if (nullptr != stmt && stmt->is_select_stmt() && nullptr != match_pred
+      && 0 == stmt->get_subquery_exprs().count()) {
     const ObSelectStmt *select_stmt = static_cast<const ObSelectStmt *>(stmt);
-    if (!select_stmt->has_for_update()) {
+    const TableItem *table_item = nullptr;
+    // A count above a join or a residual predicate can still consume document ids.
+    // Apply this guard to marked LIMIT subqueries as well as to bare COUNT(*).
+    // has_group_by() also includes scalar aggregates, so check grouping keys explicitly.
+    if (select_stmt->is_single_table_stmt()
+        && !select_stmt->get_from_item(0).is_joined_
+        && nullptr != (table_item = select_stmt->get_table_item(select_stmt->get_from_item(0)))
+        && table_item->is_basic_table()
+        && !select_stmt->is_set_stmt()
+        && !select_stmt->has_for_update()
+        && !select_stmt->is_distinct()
+        && 0 == select_stmt->get_group_expr_size()
+        && 0 == select_stmt->get_rollup_expr_size()
+        && !select_stmt->has_having()
+        && !select_stmt->has_order_by()
+        && 0 == select_stmt->get_window_func_count()
+        && 1 == select_stmt->get_condition_size()
+        && select_stmt->get_condition_exprs().at(0) == match_pred
+        && ObMatchAgainstMode::NATURAL_LANGUAGE_MODE == match_expr.get_mode_flag()) {
       if (select_stmt->is_count_only_output()) {
-        // only the number of rows of this sub query is observed by the outer query
-        need_count_only = true;
+        // The rewrite has made all output values constant. Keep that invariant if
+        // a later transformation changed the marked statement.
+        need_count_only = 0 == select_stmt->get_aggr_item_size()
+            && nullptr == select_stmt->get_offset_expr()
+            && nullptr == select_stmt->get_limit_percent_expr()
+            && !select_stmt->is_fetch_with_ties();
+        for (int64_t i = 0; need_count_only && i < select_stmt->get_select_item_size(); ++i) {
+          const ObRawExpr *select_expr = select_stmt->get_select_item(i).expr_;
+          need_count_only = nullptr != select_expr && select_expr->is_const_expr();
+        }
       } else if (!select_stmt->has_limit()
-          && !select_stmt->is_distinct()
-          && !select_stmt->has_group_by()
-          && !select_stmt->has_having()
-          && !select_stmt->has_order_by()
-          && 0 == select_stmt->get_window_func_count()
           && 1 == select_stmt->get_select_item_size()
-          && ObMatchAgainstMode::NATURAL_LANGUAGE_MODE == match_expr.get_mode_flag()) {
+          && 1 == select_stmt->get_aggr_item_size()) {
         const ObRawExpr *select_expr = select_stmt->get_select_item(0).expr_;
         if (nullptr != select_expr && T_FUN_COUNT == select_expr->get_expr_type()) {
           const ObAggFunRawExpr *count_expr = static_cast<const ObAggFunRawExpr *>(select_expr);
@@ -12095,8 +12119,19 @@ int ObLogPlan::prepare_text_retrieval_scan(const ObIArray<ObRawExpr *> &scan_mat
       // retrieval scan satisfies it, so the filter is removed from the plan.
       tr_info.need_calc_relevance_ = false;
       tr_info.pushdown_match_filter_ = NULL;
-      // nothing above the scan observes its output rows, so it only has to count them
-      tr_info.count_only_scan_ = need_count_only_text_scan(get_stmt(), *match_against);
+      // Count only after proving that neither statement operators nor residual scan
+      // work consumes the merged document ids. Pushdown filters are attached after
+      // this function returns, so inspect them on the access path as well.
+      const AccessPath *access_path = table_scan->get_access_path();
+      tr_info.count_only_scan_ = 0 == scan_filters.count()
+          && 1 == all_match_filters.count()
+          && all_match_filters.at(0) == match_pred
+          && nullptr != access_path
+          && 0 == access_path->pushdown_filters_.count()
+          && !access_path->domain_idx_info_.has_func_lookup()
+          && !access_path->vec_idx_info_.has_vec_index()
+          && table_scan->get_sample_info().is_no_sample()
+          && need_count_only_text_scan(get_stmt(), *match_against, match_pred);
       if (OB_FAIL(append_array_no_dup(get_optimizer_context().get_query_ctx()->all_expr_constraints_,
                                       constraints))) {
         LOG_WARN("failed to append expr constraints", K(ret));

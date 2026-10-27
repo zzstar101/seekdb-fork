@@ -294,10 +294,24 @@ int ObBasicEnglishNormalizer::get_next(ObDatum &next_token, int64_t &token_freq)
       ret = OB_ERR_UNEXPECTED;
     } else {
       ObString norm_alnum_token(norm_token_len, norm_token_ptr);
-      ObString norm_lower_token;
-      if (OB_FAIL(ObCharset::tolower(cs_, norm_alnum_token, norm_lower_token, norm_allocator_))) {
+      bool already_lower_ascii = common::CS_TYPE_UTF8MB4_BIN == cs_->number
+          || common::CS_TYPE_UTF8MB4_GENERAL_CI == cs_->number
+          || common::CS_TYPE_UTF8MB4_UNICODE_CI == cs_->number;
+      for (uint32_t i = 0; already_lower_ascii && i < norm_token_len; ++i) {
+        const unsigned char byte = static_cast<unsigned char>(norm_token_ptr[i]);
+        already_lower_ascii = byte < 0x80 && (byte < 'A' || byte > 'Z');
+      }
+      if (already_lower_ascii) {
+        // These collations leave lowercase ASCII unchanged. This input view is
+        // valid until the next get_next(), just like norm_allocator_ storage;
+        // downstream consumers copy any token that they retain.
+        next_token.set_string(norm_alnum_token);
       } else {
-        next_token.set_string(norm_lower_token);
+        ObString norm_lower_token;
+        if (OB_FAIL(ObCharset::tolower(cs_, norm_alnum_token, norm_lower_token, norm_allocator_))) {
+        } else {
+          next_token.set_string(norm_lower_token);
+        }
       }
     }
   }

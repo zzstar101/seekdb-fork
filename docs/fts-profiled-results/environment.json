@@ -1,0 +1,31 @@
+{
+  "source_commit": "9f846938b309a3e5320a61f71cb84ef8d375185a",
+  "source_tree": "f85ead64ddaebc00cd462e1f76f40b31e949e47a",
+  "platform": "Linux-6.18.55-x86_64-with-glibc2.39",
+  "cpu_max": "800000 100000",
+  "memory_max": "8589934592",
+  "compiler_flags": {
+    "build_type": "RelWithDebInfo",
+    "c_and_cxx": "-O2 -g1 -DNDEBUG",
+    "unity_batch_size": 10,
+    "make_jobs": 6,
+    "rust_toolchain": "1.98.1",
+    "rust_jobs": 2
+  },
+  "benchmark_blobs": {
+    "fts_large_bench.sh": "596ea5d1c0038e666b78aa94bef22d2dfb87ffc9e84dbc7e2a1da1f746424462",
+    "fts_large_bench_baseline.json": "f4e97eddb2e49c982b967fc8047f7cf37177eebe53d648f6746d85aacda91f0c",
+    "fts_large_bench_gen.py": "b0c816dd8211ac0471f60b72a37a3fb5c62580357a5b6d7ac95f5a8c2e3f143d",
+    "fts_large_bench_score.py": "bea52eb1c68d05693bb3ac5b910ab0e2fa0e70e01582f40466898ee1e2e3ef55",
+    "fts_large_bench_setup.sql": "311826751df7f51ac45156fb4284aeca9bd9197370aceb88f4fb92832b458108"
+  },
+  "cargo_lock_sha256": "431e4e96f3d0f6dc09be37e6cb43231e40ba9b9a38001c1991c22c7860712eb2",
+  "external_cargo_lock_sha256": "fb3e38704d5174886b047a059ab64b46fc4ba54c8155d6661f654192c9413443",
+  "server_parameters": {
+    "memory_budget": "4G",
+    "cpu_count": 8,
+    "log_disk_size": "2G"
+  },
+  "baseline_build_note": "Started with 3 jobs; resumed with 6 after measured compiler RSS of 0.4-0.6 GiB. Compiler and unity flags unchanged.",
+  "final_measurement_note": "Final paired measurements pin log_disk_size=2G; earlier exploratory runs used automatic sizing."
+}

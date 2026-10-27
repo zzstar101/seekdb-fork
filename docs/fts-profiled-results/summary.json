@@ -1,0 +1,187 @@
+{
+  "baseline_source_commit": "9f846938b309a3e5320a61f71cb84ef8d375185a",
+  "binary_sha256": {
+    "baseline": "afae6ca3905230c68e3b17ea9b7519d78f3a66956fe8d3fee88f257c1b76c9ad",
+    "optimized": "78ab5449987c4a8e1e51e46eeee35d457fff1179dedbc8332f506695de98a011"
+  },
+  "parameters": {
+    "rows": 20000,
+    "batch": 500,
+    "rounds": 3000,
+    "query_rounds": 200,
+    "samples": 3,
+    "warmup": 30,
+    "skip_load": 0
+  },
+  "execution_order": [
+    "baseline-1",
+    "optimized-1",
+    "optimized-2",
+    "baseline-2",
+    "baseline-3",
+    "optimized-3"
+  ],
+  "metrics": {
+    "build_ik_all_sec": {
+      "baseline_mean": 7.6259999999999994,
+      "optimized_mean": 7.492666666666667,
+      "reduction": 0.017484045808199955,
+      "baseline_runs": [
+        7.893,
+        7.693,
+        7.292
+      ],
+      "optimized_runs": [
+        7.295,
+        7.601,
+        7.582
+      ],
+      "baseline_sample_stdev": 0.3060506494030032,
+      "optimized_sample_stdev": 0.17144775686293867
+    },
+    "build_ik_content_sec": {
+      "baseline_mean": 5.643666666666667,
+      "optimized_mean": 5.445333333333333,
+      "reduction": 0.03514263776504656,
+      "baseline_runs": [
+        5.748,
+        5.44,
+        5.743
+      ],
+      "optimized_runs": [
+        5.142,
+        5.646,
+        5.548
+      ],
+      "baseline_sample_stdev": 0.17639822372499478,
+      "optimized_sample_stdev": 0.26722524830811406
+    },
+    "build_beng_en_sec": {
+      "baseline_mean": 3.1373333333333333,
+      "optimized_mean": 2.9363333333333332,
+      "reduction": 0.06406714832129201,
+      "baseline_runs": [
+        3.342,
+        3.233,
+        2.837
+      ],
+      "optimized_runs": [
+        3.034,
+        2.838,
+        2.937
+      ],
+      "baseline_sample_stdev": 0.2657448651118838,
+      "optimized_sample_stdev": 0.09800170066551553
+    },
+    "tokenize_ik_avg_ms": {
+      "baseline_mean": 0.11736666666666666,
+      "optimized_mean": 0.11393333333333333,
+      "reduction": 0.029253053109911886,
+      "baseline_runs": [
+        0.1316,
+        0.1107,
+        0.1098
+      ],
+      "optimized_runs": [
+        0.1135,
+        0.1235,
+        0.1048
+      ],
+      "baseline_sample_stdev": 0.012334639570467118,
+      "optimized_sample_stdev": 0.009357528163640935
+    },
+    "tokenize_beng_avg_ms": {
+      "baseline_mean": 0.0741,
+      "optimized_mean": 0.07293333333333334,
+      "reduction": 0.01574448942869988,
+      "baseline_runs": [
+        0.081,
+        0.0663,
+        0.075
+      ],
+      "optimized_runs": [
+        0.0812,
+        0.0635,
+        0.0741
+      ],
+      "baseline_sample_stdev": 0.007391210996852954,
+      "optimized_sample_stdev": 0.008907487487127516
+    },
+    "query_cn_avg_ms": {
+      "baseline_mean": 1.6637333333333333,
+      "optimized_mean": 1.3786,
+      "reduction": 0.17138163167174225,
+      "baseline_runs": [
+        1.6927,
+        1.5548,
+        1.7437
+      ],
+      "optimized_runs": [
+        1.3865,
+        1.3387,
+        1.4106
+      ],
+      "baseline_sample_stdev": 0.0977246301263573,
+      "optimized_sample_stdev": 0.03659521826687201
+    },
+    "query_beng_avg_ms": {
+      "baseline_mean": 2.3925,
+      "optimized_mean": 2.1285666666666665,
+      "reduction": 0.11031696273075597,
+      "baseline_runs": [
+        2.3865,
+        2.307,
+        2.484
+      ],
+      "optimized_runs": [
+        2.1129,
+        2.0672,
+        2.2056
+      ],
+      "baseline_sample_stdev": 0.08865241113472326,
+      "optimized_sample_stdev": 0.07051753918943378
+    },
+    "query_mixed_avg_ms": {
+      "baseline_mean": 1.7538,
+      "optimized_mean": 1.5494666666666668,
+      "reduction": 0.11650891397726837,
+      "baseline_runs": [
+        1.6761,
+        1.7213,
+        1.864
+      ],
+      "optimized_runs": [
+        1.506,
+        1.5583,
+        1.5841
+      ],
+      "baseline_sample_stdev": 0.09807543015455,
+      "optimized_sample_stdev": 0.039792252177193184
+    },
+    "query_limit_avg_ms": {
+      "baseline_mean": 0.28223333333333334,
+      "optimized_mean": 0.2599666666666667,
+      "reduction": 0.07889453171134986,
+      "baseline_runs": [
+        0.2554,
+        0.2743,
+        0.317
+      ],
+      "optimized_runs": [
+        0.2333,
+        0.2463,
+        0.3003
+      ],
+      "baseline_sample_stdev": 0.03155698549185795,
+      "optimized_sample_stdev": 0.03552933060632206
+    }
+  },
+  "category_reductions": {
+    "build": 0.03889794396484617,
+    "tokenize": 0.022498771269305884,
+    "query": 0.11927551002277911
+  },
+  "equal_category_reduction": 0.06022407508564372,
+  "official_ci_score": null,
+  "official_ci_note": "Not run; user-reported original FTS raw score is 66.737. Local score against the fixed CI baseline is already capped for the original binary."
+}

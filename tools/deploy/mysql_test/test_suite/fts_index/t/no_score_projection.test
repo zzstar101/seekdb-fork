@@ -1,0 +1,189 @@
+# description: score-free FTS projection with independent membership and score oracles.
+# The literal counts and id sets below are derived from the fixture, not from MATCH.
+# score_oracle stores observable scores via INSERT SELECT, so it retains the scored
+# path. Compare score-dependent behavior to that table without hardcoding doubles.
+--disable_query_log
+--disable_warnings
+DROP DATABASE IF EXISTS fts_no_score_projection;
+--enable_warnings
+CREATE DATABASE fts_no_score_projection;
+USE fts_no_score_projection;
+SET NAMES utf8mb4;
+SET ob_query_timeout = 100000000;
+SET ob_trx_timeout = 100000000;
+CREATE TABLE docs (
+  id INT PRIMARY KEY,
+  title VARCHAR(200),
+  body TEXT,
+  category INT,
+  FULLTEXT INDEX body_beng(body) WITH PARSER beng,
+  FULLTEXT INDEX all_ik(title, body) WITH PARSER ik
+);
+INSERT INTO docs VALUES
+  (1, '数据库', 'alpha beta alpha', 1),
+  (2, '全文索引', 'alpha gamma', 2),
+  (3, '数据库', 'beta gamma', 1),
+  (4, '空白', '', 0),
+  (5, '空值', NULL, 0),
+  (6, '无关', 'delta epsilon', 2),
+  (7, '英文', 'ALPHA beta', 2),
+  (8, '英文', 'unrelated document', 1);
+
+--echo cold_and_cached_counts
+
+SELECT COUNT(*) AS hits FROM docs WHERE MATCH(body) AGAINST('alpha beta');
+
+SELECT COUNT(*) AS hits FROM docs WHERE MATCH(body) AGAINST('alpha beta');
+
+SELECT COUNT(*) AS hits FROM docs WHERE MATCH(body) AGAINST('alpha beta');
+
+SELECT COUNT(*) AS hits FROM docs WHERE MATCH(body) AGAINST('alpha');
+
+SELECT COUNT(*) AS hits FROM docs WHERE MATCH(body) AGAINST('alpha alpha');
+
+SELECT COUNT(*) AS hits FROM docs WHERE MATCH(body) AGAINST('');
+
+SELECT COUNT(*) AS hits FROM docs WHERE MATCH(body) AGAINST('unmatchedzzword');
+
+SELECT COUNT(*) AS hits FROM docs WHERE MATCH(body) AGAINST('alpha beta') > 0;
+
+SELECT COUNT(1) AS hits FROM docs WHERE MATCH(body) AGAINST('alpha beta');
+
+SELECT COUNT(body) AS hits FROM docs WHERE MATCH(body) AGAINST('alpha beta');
+
+--echo independent_scored_oracle
+
+CREATE TABLE score_oracle (id INT PRIMARY KEY, score DOUBLE);
+INSERT INTO score_oracle
+  SELECT id, MATCH(body) AGAINST('alpha beta')
+  FROM docs WHERE MATCH(body) AGAINST('alpha beta');
+
+SELECT GROUP_CONCAT(id ORDER BY id) AS ids FROM score_oracle;
+
+SELECT COUNT(*) AS positive_scores FROM score_oracle WHERE score > 0;
+
+SELECT
+  (SELECT COUNT(*) FROM docs WHERE MATCH(body) AGAINST('alpha beta') > 0.2)
+  = (SELECT COUNT(*) FROM score_oracle WHERE score > 0.2)
+  AS threshold_matches_oracle;
+
+SELECT
+  (SELECT GROUP_CONCAT(id ORDER BY id) FROM
+    (SELECT id FROM docs WHERE MATCH(body) AGAINST('alpha beta')
+      ORDER BY MATCH(body) AGAINST('alpha beta') DESC, id LIMIT 2) d)
+  = (SELECT GROUP_CONCAT(id ORDER BY id) FROM
+    (SELECT id FROM score_oracle ORDER BY score DESC, id LIMIT 2) s)
+  AS topk_matches_oracle;
+
+SELECT GROUP_CONCAT(id ORDER BY id) AS ids FROM docs WHERE MATCH(body) AGAINST('alpha beta') AND category = 1;
+
+SELECT GROUP_CONCAT(id ORDER BY id) AS ids FROM docs WHERE MATCH(body) AGAINST('+alpha -gamma' IN BOOLEAN MODE);
+
+--echo count_only_fallbacks
+
+# Residual predicates and joins must retain values used above the retrieval merge.
+CREATE TABLE allowed (id INT PRIMARY KEY, marker INT);
+INSERT INTO allowed VALUES (1, 1), (3, 1), (8, 1);
+SELECT COUNT(*) AS hits FROM docs WHERE MATCH(body) AGAINST('alpha beta') AND id >= 3;
+SELECT COUNT(*) AS hits FROM docs WHERE MATCH(body) AGAINST('alpha beta') AND category = 1;
+SELECT COUNT(*) AS hits FROM docs d JOIN allowed a ON d.id = a.id
+  WHERE MATCH(d.body) AGAINST('alpha beta');
+SELECT COUNT(*) AS hits FROM docs d CROSS JOIN allowed a
+  WHERE MATCH(d.body) AGAINST('alpha beta');
+SELECT COUNT(*) AS hits FROM
+  (SELECT id FROM docs WHERE MATCH(body) AGAINST('alpha beta') AND category = 1 LIMIT 2) t;
+SELECT COUNT(*) AS hits FROM
+  (SELECT d.id FROM docs d JOIN allowed a ON d.id = a.id
+    WHERE MATCH(d.body) AGAINST('alpha beta') LIMIT 2) t;
+SELECT category AS category, COUNT(*) AS hits FROM docs
+  WHERE MATCH(body) AGAINST('alpha beta') GROUP BY category ORDER BY category;
+SELECT COUNT(DISTINCT category) AS categories FROM docs WHERE MATCH(body) AGAINST('alpha beta');
+SELECT COUNT(*) AS hits FROM docs WHERE MATCH(body) AGAINST('alpha beta') HAVING COUNT(*) = 4;
+SELECT COUNT(*) AS hits, SUM(category) AS category_sum FROM docs WHERE MATCH(body) AGAINST('alpha beta');
+
+--echo ik_multicolumn
+
+SELECT COUNT(*) AS hits FROM docs WHERE MATCH(title, body) AGAINST('数据库');
+
+SELECT GROUP_CONCAT(id ORDER BY id) AS ids FROM docs WHERE MATCH(title, body) AGAINST('数据库');
+
+SELECT COUNT(*) AS hits FROM docs WHERE MATCH(title, body) AGAINST('数据库 alpha');
+
+--echo count_over_limit
+
+SELECT COUNT(*) AS hits FROM (SELECT id FROM docs WHERE MATCH(body) AGAINST('alpha beta') LIMIT 0) t;
+
+SELECT COUNT(*) AS hits FROM (SELECT id FROM docs WHERE MATCH(body) AGAINST('alpha beta') LIMIT 2) t;
+
+SELECT COUNT(*) AS hits FROM (SELECT id FROM docs WHERE MATCH(body) AGAINST('alpha beta') LIMIT 100) t;
+
+SELECT COUNT(*) AS hits FROM (SELECT id FROM docs WHERE MATCH(body) AGAINST('alpha beta') LIMIT 2 OFFSET 1) t;
+
+--echo prepared_plan_reuse
+
+PREPARE count_stmt FROM 'SELECT COUNT(*) AS hits FROM docs WHERE MATCH(body) AGAINST(?)';
+
+SET @term = 'alpha';
+
+EXECUTE count_stmt USING @term;
+
+SET @term = 'delta';
+
+EXECUTE count_stmt USING @term;
+
+SET @term = '';
+
+EXECUTE count_stmt USING @term;
+
+SET @term = 'alpha beta';
+
+EXECUTE count_stmt USING @term;
+
+--echo dml_and_rollback
+
+INSERT INTO docs VALUES (9, '新增', 'alpha epsilon', 1);
+UPDATE docs SET body = 'delta gamma' WHERE id = 2;
+DELETE FROM docs WHERE id = 7;
+
+SELECT COUNT(*) AS hits FROM docs WHERE MATCH(body) AGAINST('alpha');
+
+SELECT GROUP_CONCAT(id ORDER BY id) AS ids FROM docs WHERE MATCH(body) AGAINST('alpha');
+
+SET @term = 'alpha';
+
+EXECUTE count_stmt USING @term;
+
+START TRANSACTION;
+INSERT INTO docs VALUES (10, '事务', 'alpha transaction', 1);
+
+SELECT COUNT(*) AS hits FROM docs WHERE MATCH(body) AGAINST('alpha');
+
+ROLLBACK;
+
+SELECT COUNT(*) AS hits FROM docs WHERE MATCH(body) AGAINST('alpha');
+
+EXECUTE count_stmt USING @term;
+
+DEALLOCATE PREPARE count_stmt;
+
+--echo heap_document_ids
+
+CREATE TABLE heap_docs (
+  body TEXT,
+  FULLTEXT INDEX body_beng(body) WITH PARSER beng
+);
+INSERT INTO heap_docs VALUES ('alpha beta'), ('alpha gamma'), ('beta'), (''), (NULL);
+
+SELECT COUNT(*) AS hits FROM heap_docs WHERE MATCH(body) AGAINST('alpha beta');
+
+SELECT COUNT(*) AS hits FROM heap_docs WHERE MATCH(body) AGAINST('alpha');
+
+SELECT COUNT(*) AS hits FROM (SELECT body FROM heap_docs WHERE MATCH(body) AGAINST('alpha') LIMIT 1) t;
+
+UPDATE heap_docs SET body = 'delta' WHERE body = 'alpha beta';
+DELETE FROM heap_docs WHERE body = 'alpha gamma';
+
+SELECT COUNT(*) AS hits FROM heap_docs WHERE MATCH(body) AGAINST('alpha');
+
+DROP DATABASE fts_no_score_projection;
+--enable_query_log

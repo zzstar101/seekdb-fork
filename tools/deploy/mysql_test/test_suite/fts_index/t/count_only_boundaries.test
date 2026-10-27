@@ -1,0 +1,251 @@
+# description: exact FTS count cardinalities across 256-row batch boundaries.
+# Query terms encode independently known id sets; no residual id predicate is
+# added to the MATCH counts, so the count-only path remains eligible.
+# built_docs is loaded before index creation; mem_docs is populated after index
+# creation. Later DML overlays the built index with new versions and tombstones.
+# Scored INSERT SELECT stores observable scores and stays outside count-only.
+--disable_query_log
+--disable_warnings
+DROP DATABASE IF EXISTS fts_count_boundaries;
+--enable_warnings
+CREATE DATABASE fts_count_boundaries;
+USE fts_count_boundaries;
+SET NAMES utf8mb4;
+SET ob_query_timeout = 100000000;
+SET ob_trx_timeout = 100000000;
+CREATE TABLE digits (n INT PRIMARY KEY);
+INSERT INTO digits VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9);
+CREATE TABLE built_docs (id INT PRIMARY KEY, body VARCHAR(200));
+INSERT INTO built_docs
+SELECT n, CONCAT(IF(n <= 255, 'alpha alpha ', ''),
+                 IF(n <= 256, 'bravo ', ''),
+                 IF(n <= 257, 'charlie ', ''),
+                 IF(n <= 512, 'delta ', ''),
+                 'echo ', IF(MOD(n, 2) = 1, 'oddset', 'evenset'))
+FROM (SELECT 1 + a.n + 10 * b.n + 100 * c.n AS n
+      FROM digits a CROSS JOIN digits b CROSS JOIN digits c) numbers
+WHERE n <= 513;
+CREATE FULLTEXT INDEX body_beng ON built_docs(body) WITH PARSER beng;
+CREATE TABLE mem_docs (
+  id INT PRIMARY KEY,
+  body VARCHAR(200),
+  FULLTEXT INDEX body_beng(body) WITH PARSER beng
+);
+INSERT INTO mem_docs SELECT id, body FROM built_docs;
+CREATE TABLE score_oracle (
+  term VARCHAR(20), id INT, score DOUBLE, PRIMARY KEY(term, id)
+);
+
+--echo built_index_boundaries
+
+SELECT COUNT(*) AS hits FROM built_docs WHERE MATCH(body) AGAINST('alpha');
+
+SELECT COUNT(*) AS hits FROM built_docs WHERE MATCH(body) AGAINST('bravo');
+
+SELECT COUNT(*) AS hits FROM built_docs WHERE MATCH(body) AGAINST('charlie');
+
+SELECT COUNT(*) AS hits FROM built_docs WHERE MATCH(body) AGAINST('delta');
+
+SELECT COUNT(*) AS hits FROM built_docs WHERE MATCH(body) AGAINST('echo');
+
+SELECT COUNT(*) AS hits FROM built_docs WHERE MATCH(body) AGAINST('oddset');
+
+SELECT COUNT(*) AS hits FROM built_docs WHERE MATCH(body) AGAINST('evenset');
+
+SELECT COUNT(*) AS hits FROM built_docs WHERE MATCH(body) AGAINST('alpha alpha');
+
+SELECT COUNT(*) AS hits FROM built_docs WHERE MATCH(body) AGAINST('alpha bravo alpha bravo');
+
+SELECT COUNT(*) AS hits FROM built_docs WHERE MATCH(body) AGAINST('alpha bravo charlie delta echo alpha');
+
+SELECT COUNT(*) AS hits FROM built_docs WHERE MATCH(body) AGAINST('oddset evenset');
+
+SELECT COUNT(*) AS hits FROM built_docs WHERE MATCH(body) AGAINST('oddset alpha');
+
+SELECT COUNT(*) AS hits FROM built_docs WHERE MATCH(body) AGAINST('');
+
+SELECT COUNT(*) AS hits FROM built_docs WHERE MATCH(body) AGAINST('missingzzterm');
+
+--echo insert_after_index_boundaries
+
+SELECT COUNT(*) AS hits FROM mem_docs WHERE MATCH(body) AGAINST('alpha');
+
+SELECT COUNT(*) AS hits FROM mem_docs WHERE MATCH(body) AGAINST('bravo');
+
+SELECT COUNT(*) AS hits FROM mem_docs WHERE MATCH(body) AGAINST('charlie');
+
+SELECT COUNT(*) AS hits FROM mem_docs WHERE MATCH(body) AGAINST('delta');
+
+SELECT COUNT(*) AS hits FROM mem_docs WHERE MATCH(body) AGAINST('echo');
+
+SELECT COUNT(*) AS hits FROM mem_docs WHERE MATCH(body) AGAINST('alpha bravo charlie delta echo alpha');
+
+SELECT COUNT(*) AS hits FROM mem_docs WHERE MATCH(body) AGAINST('oddset alpha');
+
+--echo scored_membership_oracle
+
+INSERT INTO score_oracle SELECT 'alpha', id, MATCH(body) AGAINST('alpha') FROM built_docs WHERE MATCH(body) AGAINST('alpha');
+
+INSERT INTO score_oracle SELECT 'bravo', id, MATCH(body) AGAINST('bravo') FROM built_docs WHERE MATCH(body) AGAINST('bravo');
+
+INSERT INTO score_oracle SELECT 'charlie', id, MATCH(body) AGAINST('charlie') FROM built_docs WHERE MATCH(body) AGAINST('charlie');
+
+INSERT INTO score_oracle SELECT 'delta', id, MATCH(body) AGAINST('delta') FROM built_docs WHERE MATCH(body) AGAINST('delta');
+
+INSERT INTO score_oracle SELECT 'echo', id, MATCH(body) AGAINST('echo') FROM built_docs WHERE MATCH(body) AGAINST('echo');
+
+SELECT term, COUNT(*) AS hits, MIN(id) AS first_id, MAX(id) AS last_id,
+       SUM(score > 0) AS positive_scores
+FROM score_oracle GROUP BY term ORDER BY term;
+
+SELECT
+  (SELECT COUNT(*) FROM built_docs WHERE MATCH(body) AGAINST('alpha bravo alpha bravo'))
+  = (SELECT COUNT(DISTINCT id) FROM score_oracle WHERE term IN ('alpha', 'bravo'))
+  AS union_matches_oracle;
+
+SELECT
+  (SELECT COUNT(*) FROM built_docs WHERE MATCH(body) AGAINST('echo'))
+  = (SELECT COUNT(*) FROM score_oracle WHERE term = 'echo' AND score > 0)
+  AS count_matches_oracle;
+
+--echo limits_at_batch_boundaries
+
+SELECT COUNT(*) AS hits FROM (SELECT id FROM built_docs WHERE MATCH(body) AGAINST('echo') LIMIT 0) t;
+
+SELECT COUNT(*) AS hits FROM (SELECT id FROM built_docs WHERE MATCH(body) AGAINST('echo') LIMIT 1) t;
+
+SELECT COUNT(*) AS hits FROM (SELECT id FROM built_docs WHERE MATCH(body) AGAINST('echo') LIMIT 256) t;
+
+SELECT COUNT(*) AS hits FROM (SELECT id FROM built_docs WHERE MATCH(body) AGAINST('echo') LIMIT 257) t;
+
+SELECT COUNT(*) AS hits FROM (SELECT id FROM built_docs WHERE MATCH(body) AGAINST('echo') LIMIT 512) t;
+
+SELECT COUNT(*) AS hits FROM (SELECT id FROM built_docs WHERE MATCH(body) AGAINST('echo') LIMIT 513) t;
+
+SELECT COUNT(*) AS hits FROM (SELECT id FROM built_docs WHERE MATCH(body) AGAINST('echo') LIMIT 514) t;
+
+SELECT COUNT(*) AS hits FROM (SELECT id FROM built_docs WHERE MATCH(body) AGAINST('alpha') LIMIT 256) t;
+
+SELECT COUNT(*) AS hits FROM (SELECT id FROM built_docs WHERE MATCH(body) AGAINST('delta') LIMIT 513) t;
+
+SELECT COUNT(*) AS hits FROM (SELECT id FROM mem_docs WHERE MATCH(body) AGAINST('echo') LIMIT 0) t;
+
+SELECT COUNT(*) AS hits FROM (SELECT id FROM mem_docs WHERE MATCH(body) AGAINST('echo') LIMIT 1) t;
+
+SELECT COUNT(*) AS hits FROM (SELECT id FROM mem_docs WHERE MATCH(body) AGAINST('echo') LIMIT 256) t;
+
+SELECT COUNT(*) AS hits FROM (SELECT id FROM mem_docs WHERE MATCH(body) AGAINST('echo') LIMIT 257) t;
+
+--echo prepared_batch_reuse
+
+PREPARE count_stmt FROM 'SELECT COUNT(*) AS hits FROM built_docs WHERE MATCH(body) AGAINST(?)';
+
+SET @term = 'delta';
+
+EXECUTE count_stmt USING @term;
+
+SET @term = 'echo';
+
+EXECUTE count_stmt USING @term;
+
+SET @term = 'alpha';
+
+EXECUTE count_stmt USING @term;
+
+SET @term = 'alpha alpha';
+
+EXECUTE count_stmt USING @term;
+
+SET @term = '';
+
+EXECUTE count_stmt USING @term;
+
+SET @term = 'missingzzterm';
+
+EXECUTE count_stmt USING @term;
+
+SET @term = 'echo';
+
+EXECUTE count_stmt USING @term;
+
+DEALLOCATE PREPARE count_stmt;
+
+--echo committed_versions_and_delete
+
+UPDATE built_docs SET body = 'replacement' WHERE id = 256;
+DELETE FROM built_docs WHERE id = 257;
+INSERT INTO built_docs VALUES (514, 'alpha bravo charlie delta echo oddset');
+UPDATE built_docs SET body = CONCAT(body, ' alpha') WHERE id = 513;
+
+SELECT COUNT(*) AS hits FROM built_docs WHERE MATCH(body) AGAINST('alpha');
+
+SELECT COUNT(*) AS hits FROM built_docs WHERE MATCH(body) AGAINST('bravo');
+
+SELECT COUNT(*) AS hits FROM built_docs WHERE MATCH(body) AGAINST('charlie');
+
+SELECT COUNT(*) AS hits FROM built_docs WHERE MATCH(body) AGAINST('delta');
+
+SELECT COUNT(*) AS hits FROM built_docs WHERE MATCH(body) AGAINST('echo');
+
+SELECT COUNT(*) AS hits FROM built_docs WHERE MATCH(body) AGAINST('alpha bravo charlie delta echo alpha');
+
+DELETE FROM score_oracle;
+
+INSERT INTO score_oracle SELECT 'alpha', id, MATCH(body) AGAINST('alpha') FROM built_docs WHERE MATCH(body) AGAINST('alpha');
+
+INSERT INTO score_oracle SELECT 'echo', id, MATCH(body) AGAINST('echo') FROM built_docs WHERE MATCH(body) AGAINST('echo');
+
+SELECT term, COUNT(*) AS hits, SUM(id) AS id_sum, SUM(score > 0) AS positive_scores
+FROM score_oracle GROUP BY term ORDER BY term;
+
+SELECT
+  (SELECT COUNT(*) FROM built_docs WHERE MATCH(body) AGAINST('alpha'))
+  = (SELECT COUNT(*) FROM score_oracle WHERE term = 'alpha' AND score > 0)
+  AS count_matches_oracle;
+
+--echo read_own_writes
+
+START TRANSACTION;
+UPDATE built_docs SET body = 'alpha echo' WHERE id = 256;
+DELETE FROM built_docs WHERE id = 513;
+INSERT INTO built_docs VALUES (515, 'alpha bravo charlie delta echo');
+
+SELECT COUNT(*) AS hits FROM built_docs WHERE MATCH(body) AGAINST('alpha');
+
+SELECT COUNT(*) AS hits FROM built_docs WHERE MATCH(body) AGAINST('bravo');
+
+SELECT COUNT(*) AS hits FROM built_docs WHERE MATCH(body) AGAINST('delta');
+
+SELECT COUNT(*) AS hits FROM built_docs WHERE MATCH(body) AGAINST('echo');
+
+DELETE FROM score_oracle WHERE term = 'echo';
+INSERT INTO score_oracle SELECT 'echo', id, MATCH(body) AGAINST('echo') FROM built_docs WHERE MATCH(body) AGAINST('echo');
+
+SELECT COUNT(*) AS hits, SUM(score > 0) AS positive_scores FROM score_oracle WHERE term = 'echo';
+
+SELECT
+  (SELECT COUNT(*) FROM built_docs WHERE MATCH(body) AGAINST('echo'))
+  = (SELECT COUNT(*) FROM score_oracle WHERE term = 'echo' AND score > 0)
+  AS count_matches_oracle;
+
+ROLLBACK;
+
+--echo rollback_restores_boundary
+
+SELECT COUNT(*) AS hits FROM built_docs WHERE MATCH(body) AGAINST('alpha');
+
+SELECT COUNT(*) AS hits FROM built_docs WHERE MATCH(body) AGAINST('bravo');
+
+SELECT COUNT(*) AS hits FROM built_docs WHERE MATCH(body) AGAINST('delta');
+
+SELECT COUNT(*) AS hits FROM built_docs WHERE MATCH(body) AGAINST('echo');
+
+SELECT COUNT(*) AS hits, SUM(id) AS id_sum, SUM(score > 0) AS positive_scores FROM score_oracle WHERE term = 'echo';
+
+SELECT
+  (SELECT COUNT(*) FROM built_docs WHERE MATCH(body) AGAINST('echo'))
+  = (SELECT COUNT(*) FROM score_oracle WHERE term = 'echo' AND score > 0)
+  AS count_matches_oracle;
+
+DROP DATABASE fts_count_boundaries;
+--enable_query_log

@@ -1,0 +1,150 @@
+{
+  "all_candidates": {
+    "binary": "/tmp/seekdb-fts-artifacts/bin/seekdb-candidate-final",
+    "rounds": 30000,
+    "samples": 3,
+    "note": "Diagnostic only; original SQL texts with extended repetition, excluded from official full benchmark results.",
+    "cases": {
+      "ik": [
+        {
+          "wall_us": 126.0503052666536,
+          "server_cpu_us": 171.66666666666663
+        },
+        {
+          "wall_us": 119.49407709998923,
+          "server_cpu_us": 112.00000000000004
+        },
+        {
+          "wall_us": 114.04572739999517,
+          "server_cpu_us": 92.99999999999997
+        }
+      ],
+      "beng": [
+        {
+          "wall_us": 75.89454226666324,
+          "server_cpu_us": 53.66666666666665
+        },
+        {
+          "wall_us": 68.08254466665555,
+          "server_cpu_us": 50.000000000000064
+        },
+        {
+          "wall_us": 68.3109244000055,
+          "server_cpu_us": 48.999999999999964
+        }
+      ]
+    },
+    "binary_sha256": "3d6944fb01dca4285f8c01ef9d09e6493533b8c6a1596a685abb2ebf5b18e23d"
+  },
+  "baseline": {
+    "binary": "/tmp/seekdb-fts-artifacts/bin/seekdb-baseline",
+    "rounds": 30000,
+    "samples": 3,
+    "note": "Diagnostic only; original SQL texts with extended repetition, excluded from official full benchmark results.",
+    "cases": {
+      "ik": [
+        {
+          "wall_us": 143.6642269000004,
+          "server_cpu_us": 195.66666666666663
+        },
+        {
+          "wall_us": 126.01728013332831,
+          "server_cpu_us": 102.66666666666667
+        },
+        {
+          "wall_us": 128.88208443334102,
+          "server_cpu_us": 104.33333333333337
+        }
+      ],
+      "beng": [
+        {
+          "wall_us": 69.35840253333178,
+          "server_cpu_us": 49.999999999999936
+        },
+        {
+          "wall_us": 68.33870860000388,
+          "server_cpu_us": 48.000000000000036
+        },
+        {
+          "wall_us": 68.11177610000716,
+          "server_cpu_us": 49.33333333333335
+        }
+      ]
+    },
+    "binary_sha256": "afae6ca3905230c68e3b17ea9b7519d78f3a66956fe8d3fee88f257c1b76c9ad"
+  },
+  "no_beng_fastpath": {
+    "binary": "/tmp/seekdb-fts-artifacts/bin/seekdb-no-beng-fastpath",
+    "rounds": 30000,
+    "samples": 3,
+    "note": "Diagnostic only; original SQL texts with extended repetition, excluded from official full benchmark results.",
+    "cases": {
+      "ik": [
+        {
+          "wall_us": 124.3070703666793,
+          "server_cpu_us": 169.0
+        },
+        {
+          "wall_us": 121.69836856667948,
+          "server_cpu_us": 114.66666666666669
+        },
+        {
+          "wall_us": 116.7806975666584,
+          "server_cpu_us": 93.3333333333333
+        }
+      ],
+      "beng": [
+        {
+          "wall_us": 73.55088426666042,
+          "server_cpu_us": 52.99999999999999
+        },
+        {
+          "wall_us": 71.80253773334091,
+          "server_cpu_us": 50.66666666666665
+        },
+        {
+          "wall_us": 75.9909031999996,
+          "server_cpu_us": 55.33333333333334
+        }
+      ]
+    },
+    "binary_sha256": "59aede7cba265bd1fee79f933220a5234c9319dd6b1b05c85bd9ec0a4bc45fd4"
+  },
+  "original_map": {
+    "binary": "/tmp/seekdb-fts-artifacts/bin/seekdb-original-map",
+    "rounds": 30000,
+    "samples": 3,
+    "note": "Diagnostic only; original SQL texts with extended repetition, excluded from official full benchmark results.",
+    "cases": {
+      "ik": [
+        {
+          "wall_us": 127.66338419999859,
+          "server_cpu_us": 172.66666666666666
+        },
+        {
+          "wall_us": 119.27392326667056,
+          "server_cpu_us": 110.99999999999997
+        },
+        {
+          "wall_us": 112.97437523332216,
+          "server_cpu_us": 89.66666666666671
+        }
+      ],
+      "beng": [
+        {
+          "wall_us": 78.44352069999634,
+          "server_cpu_us": 55.99999999999999
+        },
+        {
+          "wall_us": 72.78123599999162,
+          "server_cpu_us": 52.33333333333334
+        },
+        {
+          "wall_us": 58.23374770000858,
+          "server_cpu_us": 42.99999999999997
+        }
+      ]
+    },
+    "binary_sha256": "78ab5449987c4a8e1e51e46eeee35d457fff1179dedbc8332f506695de98a011"
+  }
+}
