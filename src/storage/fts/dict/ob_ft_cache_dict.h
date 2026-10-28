@@ -43,6 +43,13 @@ public:
   int match_with_hit(const ObString &single_word,
                      const ObDATrieHit &last_hit,
                      ObDATrieHit &hit) const override;
+  int find_word_code(const ObString &single_word,
+                     ObFTWordCode &code,
+                     bool &found) const override;
+  int match_with_code(const ObString &single_word,
+                      const ObFTWordCode code,
+                      const ObDATrieHit &last_hit,
+                      ObDATrieHit &hit) const override;
 
 public:
   static int make_and_fetch_cache_entry(const ObFTDictDesc &desc,

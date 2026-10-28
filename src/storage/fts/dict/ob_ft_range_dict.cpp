@@ -378,6 +378,31 @@ int ObFTRangeDict::match_with_hit(const ObString &single_word,
   return last_hit.dict_->match_with_hit(single_word, last_hit, hit);
 }
 
+int ObFTRangeDict::find_word_code(const ObString &single_word,
+                                  ObFTWordCode &code,
+                                  bool &found) const
+{
+  int ret = OB_SUCCESS;
+  ObIFTDict *dict = nullptr;
+  found = false;
+  if (OB_FAIL(find_first_char_range(single_word, dict)) && OB_ENTRY_NOT_EXIST != ret) {
+  } else if (OB_ENTRY_NOT_EXIST == ret) {
+    ret = OB_SUCCESS;
+  } else if (OB_ISNULL(dict)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(dict->find_word_code(single_word, code, found))) {
+  }
+  return ret;
+}
+
+int ObFTRangeDict::match_with_code(const ObString &single_word,
+                                   const ObFTWordCode code,
+                                   const ObDATrieHit &last_hit,
+                                   ObDATrieHit &hit) const
+{
+  return last_hit.dict_->match_with_code(single_word, code, last_hit, hit);
+}
+
 namespace {
 // Range boundaries of a built-in dictionary are single characters and every caller
 // compares them against exactly one character, so CS_TYPE_UTF8MB4_BIN order is plain

@@ -76,6 +76,21 @@ int ObFTCacheDict::match_with_hit(const ObString &single_word,
   return reader_.match_with_hit(single_word, last_hit, hit);
 }
 
+int ObFTCacheDict::find_word_code(const ObString &single_word,
+                                  ObFTWordCode &code,
+                                  bool &found) const
+{
+  return reader_.find_word_code(single_word, code, found);
+}
+
+int ObFTCacheDict::match_with_code(const ObString &single_word,
+                                   const ObFTWordCode code,
+                                   const ObDATrieHit &last_hit,
+                                   ObDATrieHit &hit) const
+{
+  return reader_.match_with_code(single_word, code, last_hit, hit);
+}
+
 int ObFTCacheDict::make_and_fetch_cache_entry(const ObFTDictDesc &desc,
                                               ObFTDAT *dat_buff,
                                               const size_t buff_size,

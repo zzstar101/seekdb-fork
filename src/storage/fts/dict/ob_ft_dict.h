@@ -18,6 +18,7 @@
 #define _OCEANBASE_STORAGE_FTS_DICT_OB_FT_DICT_H_
 
 #include "lib/string/ob_string.h"
+#include "storage/fts/dict/ob_ft_dict_def.h"
 
 namespace oceanbase
 {
@@ -123,6 +124,19 @@ public:
   virtual int match_with_hit(const ObString &single_word,
                              const ObDATrieHit &last_hit,
                              ObDATrieHit &hit) const = 0;
+
+  // Resolve a single character's dictionary code once. The code belongs to the
+  // concrete DAT containing the word, so callers must keep it paired with that
+  // dictionary and must not reuse it for another range.
+  virtual int find_word_code(const ObString &single_word,
+                             ObFTWordCode &code,
+                             bool &found) const = 0;
+
+  // Match a single character whose code was already resolved from this dict.
+  virtual int match_with_code(const ObString &single_word,
+                              const ObFTWordCode code,
+                              const ObDATrieHit &last_hit,
+                              ObDATrieHit &hit) const = 0;
 };
 
 } // namespace storage

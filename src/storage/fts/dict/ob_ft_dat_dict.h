@@ -174,6 +174,15 @@ public:
                      const ObDATrieHit &last_hit,
                      ObDATrieHit &hit) const;
 
+  int find_word_code(const ObString &single_word,
+                     ObFTWordCode &code,
+                     bool &found) const;
+
+  int match_with_code(const ObString &single_word,
+                      const ObFTWordCode code,
+                      const ObDATrieHit &last_hit,
+                      ObDATrieHit &hit) const;
+
 private:
   ObFTDAT *dat_;
 

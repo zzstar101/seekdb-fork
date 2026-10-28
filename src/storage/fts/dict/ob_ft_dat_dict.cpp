@@ -247,6 +247,65 @@ int ObFTDATBuilder<DATA_TYPE>::encode(const ObString &word, ObFTWordCode &code, 
 }
 
 template <typename DATA_TYPE>
+int ObFTDATReader<DATA_TYPE>::find_word_code(const ObString &ft_char,
+                                             ObFTWordCode &code,
+                                             bool &found) const
+{
+  int ret = OB_SUCCESS;
+  ObFTWordCode resolved_code = 0;
+  found = false;
+  ObFTSingleWord word;
+  word.set_word(ft_char.ptr(), ft_char.length());
+  if (OB_FAIL(dat_->get_map()->find(word, resolved_code)) && OB_ENTRY_NOT_EXIST != ret) {
+  } else if (OB_ENTRY_NOT_EXIST == ret) {
+    ret = OB_SUCCESS;
+  } else {
+    code = resolved_code;
+    found = true;
+  }
+  return ret;
+}
+
+template <typename DATA_TYPE>
+int ObFTDATReader<DATA_TYPE>::match_with_code(const ObString &ft_char,
+                                              const ObFTWordCode code,
+                                              const ObDATrieHit &last_hit,
+                                              ObDATrieHit &hit) const
+{
+  int ret = OB_SUCCESS;
+  hit.set_unmatch();
+  int32_t *base = reinterpret_cast<int32_t *>(dat_->buff + dat_->base_offset_);
+  int32_t *check = reinterpret_cast<int32_t *>(dat_->buff + dat_->check_offset_);
+
+  if (&last_hit == &hit) {
+    // sameone
+  } else {
+    hit = last_hit;
+  }
+  if (0 == hit.base_idx_) {
+    hit.base_idx_ = 1; // from current to do check;
+  }
+  // from current place to do check
+  int32_t idx = abs(base[hit.base_idx_]) + code;
+
+  if (check[idx] != hit.base_idx_) {
+    hit.set_unmatch();
+  } else if (base[idx] < 0) {
+    hit.base_idx_ = idx;
+    hit.end_pos_ = hit.end_pos_ + ft_char.length();
+    hit.char_cnt_++;
+    hit.set_match();
+    hit.set_prefix(); // to be checked next time
+  } else {
+    hit.base_idx_ = idx;
+    hit.end_pos_ = hit.end_pos_ + ft_char.length();
+    hit.char_cnt_++;
+    hit.set_prefix();
+  }
+  return ret;
+}
+
+template <typename DATA_TYPE>
 int ObFTDATReader<DATA_TYPE>::match_with_hit(const ObString &ft_char,
                                              const ObDATrieHit &last_hit,
                                              ObDATrieHit &hit) const
